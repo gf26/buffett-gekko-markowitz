@@ -74,6 +74,10 @@ def upsert_info(cur, ticker, info):
         ON CONFLICT (ticker) DO UPDATE SET info = EXCLUDED.info, updated_at = now()
     """, (ticker, json.dumps(info, default=str)))
 
+    name = info.get("longName") or info.get("shortName")
+    if name:
+        cur.execute("UPDATE tickers SET name = %s WHERE ticker = %s", (name, ticker))
+
 
 def log(job, ticker, status, message=""):
     with engine.begin() as conn:
