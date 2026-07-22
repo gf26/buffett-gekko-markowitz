@@ -31,20 +31,68 @@ def get_active_tickers():
     return [r[0] for r in rows]
 
 
-def load_annual_statement(ticker, statement):
+def load_statement(ticker, statement, period_type):
     """Returns a DataFrame indexed by fiscal_date (desc), columns = line_item."""
     with engine.connect() as conn:
         df = pd.read_sql(
             text("""
                 SELECT fiscal_date, line_item, value FROM financials
-                WHERE ticker = :t AND statement = :s AND period_type = 'annual'
+                WHERE ticker = :t AND statement = :s AND period_type = :p
             """),
-            conn, params={"t": ticker, "s": statement},
+            conn, params={"t": ticker, "s": statement, "p": period_type},
         )
     if df.empty:
         return pd.DataFrame()
     wide = df.pivot_table(index="fiscal_date", columns="line_item", values="value", aggfunc="first")
     return wide.sort_index(ascending=False)
+
+
+# Statements that represent a flow over a period (income statement, cashflow) get
+# summed across 4 quarters to build a TTM (trailing twelve months) figure when
+# annual data isn't available. Balance sheet is a point-in-time snapshot, so it's
+# never summed - we just use the most recent quarter available instead.
+FLOW_STATEMENTS = {"income_statement", "cashflow"}
+
+
+def get_lfy_pair(ticker, statement):
+    """
+    Returns (row_lfy, row_lfy1, date_lfy, date_lfy1, source) for a statement.
+    Prefers real annual data; falls back to quarterly (summed into TTM for flow
+    statements, or just the latest snapshot for the balance sheet) when annual
+    isn't available - some tickers only have partial annual coverage on Yahoo.
+    """
+    annual = load_statement(ticker, statement, "annual")
+    if len(annual) >= 2:
+        return annual.iloc[0], annual.iloc[1], annual.index[0], annual.index[1], "annual"
+    if len(annual) == 1:
+        return annual.iloc[0], None, annual.index[0], None, "annual (1 período)"
+
+    quarterly = load_statement(ticker, statement, "quarterly")
+    if quarterly.empty:
+        return None, None, None, None, "sem dados"
+
+    if statement not in FLOW_STATEMENTS:  # balance sheet: point-in-time snapshot
+        row_lfy, date_lfy = quarterly.iloc[0], quarterly.index[0]
+        if len(quarterly) >= 5:
+            row_lfy1, date_lfy1 = quarterly.iloc[4], quarterly.index[4]  # ~1 year back
+        elif len(quarterly) >= 2:
+            row_lfy1, date_lfy1 = quarterly.iloc[-1], quarterly.index[-1]
+        else:
+            row_lfy1, date_lfy1 = None, None
+        return row_lfy, row_lfy1, date_lfy, date_lfy1, "trimestral (mais recente)"
+
+    # flow statement: sum quarters into TTM windows
+    if len(quarterly) < 4:
+        ttm = quarterly.sum(numeric_only=True, min_count=1)
+        return ttm, None, quarterly.index[0], None, "trimestral parcial (menos de 4 tri)"
+    ttm = quarterly.iloc[0:4].sum(numeric_only=True, min_count=1)
+    date_ttm = quarterly.index[0]
+    if len(quarterly) >= 8:
+        ttm1 = quarterly.iloc[4:8].sum(numeric_only=True, min_count=1)
+        date_ttm1 = quarterly.index[4]
+    else:
+        ttm1, date_ttm1 = None, None
+    return ttm, ttm1, date_ttm, date_ttm1, "TTM (soma de 4 trimestres)"
 
 
 def load_latest_price(ticker):
@@ -145,21 +193,16 @@ def compute_piotroski(bs_lfy, bs_lfy1, inc_lfy, inc_lfy1, cf_lfy):
 
 
 def compute_for_ticker(ticker):
-    bs = load_annual_statement(ticker, "balance_sheet")
-    inc = load_annual_statement(ticker, "income_statement")
-    cf = load_annual_statement(ticker, "cashflow")
+    bs_lfy, bs_lfy1, bs_date_lfy, bs_date_lfy1, bs_source = get_lfy_pair(ticker, "balance_sheet")
+    inc_lfy, inc_lfy1, inc_date_lfy, inc_date_lfy1, inc_source = get_lfy_pair(ticker, "income_statement")
+    cf_lfy, cf_lfy1, cf_date_lfy, cf_date_lfy1, cf_source = get_lfy_pair(ticker, "cashflow")
 
-    if bs.empty or inc.empty:
-        return None, "sem balanço/DRE anual suficiente"
+    if bs_lfy is None or inc_lfy is None:
+        return None, f"sem balanço ({bs_source}) ou DRE ({inc_source}) suficiente"
 
-    bs_lfy = bs.iloc[0]
-    bs_lfy1 = bs.iloc[1] if len(bs) > 1 else None
-    inc_lfy = inc.iloc[0]
-    inc_lfy1 = inc.iloc[1] if len(inc) > 1 else None
-    cf_lfy = cf.iloc[0] if not cf.empty else None
-
-    fiscal_date_lfy = bs.index[0]
-    fiscal_date_lfy1 = bs.index[1] if len(bs) > 1 else None
+    fiscal_date_lfy = bs_date_lfy
+    fiscal_date_lfy1 = bs_date_lfy1
+    data_sources = {"balance_sheet": bs_source, "income_statement": inc_source, "cashflow": cf_source}
 
     price_date, price = load_latest_price(ticker)
     market_cap = load_market_cap(ticker)
@@ -209,6 +252,7 @@ def compute_for_ticker(ticker):
     score, breakdown = compute_piotroski(bs_lfy, bs_lfy1, inc_lfy, inc_lfy1, cf_lfy)
     row["piotroski_f_score"] = score
     row["piotroski_breakdown"] = json.dumps(breakdown)
+    row["data_sources"] = json.dumps(data_sources)
     return row, None
 
 
@@ -218,6 +262,7 @@ COLUMNS = [
     "net_income_growth_pct", "operating_income_growth_pct", "dividend_yield_pct", "dividend_payout_ratio_pct",
     "book_value", "sales", "gross_earnings", "operating_earnings", "net_earnings", "cash_on_hand",
     "gross_margin_pct", "operating_margin_pct", "net_margin_pct", "piotroski_f_score", "piotroski_breakdown",
+    "data_sources",
 ]
 
 
@@ -242,21 +287,22 @@ def upsert_rows(rows):
 def main():
     tickers = get_active_tickers()
     print(f"Calculando índices fundamentalistas para {len(tickers)} tickers.")
-    rows, skipped = [], 0
+    rows, skipped_list = [], []
 
     for i, t in enumerate(tickers, start=1):
         row, reason = compute_for_ticker(t)
         if row is None:
-            skipped += 1
-            if i % 50 == 0:
-                print(f"  ...{i}/{len(tickers)}")
+            skipped_list.append((t, reason))
+            print(f"  [{t}] pulado - {reason}")
             continue
         rows.append(row)
         if i % 50 == 0:
             print(f"  ...{i}/{len(tickers)} processados")
 
     upsert_rows(rows)
-    print(f"Done. {len(rows)} tickers calculados, {skipped} pulados (fundamentos insuficientes).")
+    print(f"\nDone. {len(rows)} tickers calculados, {len(skipped_list)} pulados.")
+    if skipped_list:
+        print("Pulados:", ", ".join(t for t, _ in skipped_list))
 
 
 if __name__ == "__main__":
