@@ -123,7 +123,7 @@ def compute_beneish_m(ticker):
     bs_lfy, bs_lfy1, _ = get_lfy_pair(ticker, "balance_sheet")
     inc_lfy, inc_lfy1, _ = get_lfy_pair(ticker, "income_statement")
     cf_lfy, cf_lfy1, _ = get_lfy_pair(ticker, "cashflow")
-    if None in (bs_lfy, bs_lfy1, inc_lfy, inc_lfy1, cf_lfy, cf_lfy1):
+    if any(x is None for x in (bs_lfy, bs_lfy1, inc_lfy, inc_lfy1, cf_lfy, cf_lfy1)):
         return None, None
 
     def year_components(bs, inc, cf):
