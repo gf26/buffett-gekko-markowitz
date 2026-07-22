@@ -77,13 +77,13 @@ def compute_metrics(df):
     return {
         "obs_start": df["date"].iloc[0],
         "obs_end": df["date"].iloc[-1],
-        "trading_days": n_days,
-        "total_return_pct": round(total_return * 100, 2),
-        "cagr_pct": round(cagr * 100, 2) if cagr is not None else None,
-        "ann_volatility_pct": round(ann_vol * 100, 2),
-        "sharpe_ratio": round(sharpe, 3) if sharpe is not None else None,
-        "sortino_ratio": round(sortino, 3) if sortino is not None else None,
-        "max_drawdown_pct": round(max_drawdown * 100, 2),
+        "trading_days": int(n_days),
+        "total_return_pct": float(round(total_return * 100, 2)),
+        "cagr_pct": float(round(cagr * 100, 2)) if cagr is not None else None,
+        "ann_volatility_pct": float(round(ann_vol * 100, 2)),
+        "sharpe_ratio": float(round(sharpe, 3)) if sharpe is not None else None,
+        "sortino_ratio": float(round(sortino, 3)) if sortino is not None else None,
+        "max_drawdown_pct": float(round(max_drawdown * 100, 2)),
     }
 
 
