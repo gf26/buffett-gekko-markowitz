@@ -24,6 +24,11 @@ SELECT
     fr.net_margin_pct,
 
     fr.piotroski_f_score,
+    fr.altman_z_score,
+    fr.altman_z_zone,
+    fr.beneish_m_score,
+    fr.beneish_flag,
+    fr.value_trap_indicator,
 
     mm.cagr_pct,
     mm.ann_volatility_pct,
