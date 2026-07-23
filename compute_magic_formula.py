@@ -144,6 +144,12 @@ def rank_and_update(rows):
 
     gp_rank = df["gross_profitability_pct"].rank(ascending=False, method="min")
 
+    def as_float(x):
+        return None if pd.isna(x) else float(x)
+
+    def as_int(series, key):
+        return int(series[key]) if key in series.index and pd.notna(series[key]) else None
+
     with engine.begin() as conn:
         for ticker, row in df.iterrows():
             conn.execute(text("""
@@ -157,13 +163,13 @@ def rank_and_update(rows):
                     gross_profitability_rank = :gprank
                 WHERE ticker = :t
             """), {
-                "ev": row["enterprise_value"],
-                "ey": row["earnings_yield_pct"],
-                "roc": row["return_on_capital_pct"],
-                "mscore": int(magic_score[ticker]) if ticker in magic_score.index and pd.notna(magic_score[ticker]) else None,
-                "mrank": int(magic_rank[ticker]) if ticker in magic_rank.index and pd.notna(magic_rank[ticker]) else None,
-                "gp": row["gross_profitability_pct"],
-                "gprank": int(gp_rank[ticker]) if pd.notna(gp_rank[ticker]) else None,
+                "ev": as_float(row["enterprise_value"]),
+                "ey": as_float(row["earnings_yield_pct"]),
+                "roc": as_float(row["return_on_capital_pct"]),
+                "mscore": as_int(magic_score, ticker),
+                "mrank": as_int(magic_rank, ticker),
+                "gp": as_float(row["gross_profitability_pct"]),
+                "gprank": as_int(gp_rank, ticker),
                 "t": ticker,
             })
 
