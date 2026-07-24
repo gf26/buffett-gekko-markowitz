@@ -1,5 +1,9 @@
 -- View "screener": junta índices fundamentalistas + indicadores de mercado
--- numa única planilha, uma linha por ticker. Rode uma vez no SQL Editor.
+-- numa única planilha, uma linha por ticker.
+--
+-- Esta versão só ACRESCENTA colunas no final (Magic Formula, Gross
+-- Profitability, ranking composto por percentil) - não precisa de DROP VIEW,
+-- CREATE OR REPLACE funciona direto.
 
 CREATE OR REPLACE VIEW vw_screener AS
 SELECT
@@ -39,7 +43,20 @@ SELECT
     fr.fiscal_date_lfy,
     fr.data_sources,
     fr.calculated_at   AS fundamentos_calculados_em,
-    mm.calculated_at   AS mercado_calculado_em
+    mm.calculated_at   AS mercado_calculado_em,
+
+    fr.enterprise_value,
+    fr.earnings_yield_pct,
+    fr.return_on_capital_pct,
+    fr.magic_formula_score,
+    fr.magic_formula_rank,
+    fr.gross_profitability_pct,
+    fr.gross_profitability_rank,
+
+    fr.peer_group,
+    fr.roe_pct,
+    fr.composite_percentile,
+    fr.composite_rank
 FROM tickers t
 LEFT JOIN fundamental_ratios fr ON fr.ticker = t.ticker
 LEFT JOIN market_metrics mm     ON mm.ticker = t.ticker
