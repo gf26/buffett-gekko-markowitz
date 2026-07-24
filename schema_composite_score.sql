@@ -10,4 +10,4 @@ ALTER TABLE fundamental_ratios ADD COLUMN IF NOT EXISTS composite_rank        IN
 -- Adição: filtro de qualidade (Piotroski F-Score) como "porta de entrada"
 -- do ranking, sem esconder os tickers reprovados da view.
 ALTER TABLE fundamental_ratios ADD COLUMN IF NOT EXISTS ranking_status TEXT;
--- valores possíveis: 'ok' | 'reprovado_piotroski' | 'dados_insuficientes'
+-- valores possíveis: 'ok' | 'reprovado_piotroski' | 'piotroski_desconhecido' | 'dados_insuficientes'
