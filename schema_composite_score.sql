@@ -11,3 +11,10 @@ ALTER TABLE fundamental_ratios ADD COLUMN IF NOT EXISTS composite_rank        IN
 -- do ranking, sem esconder os tickers reprovados da view.
 ALTER TABLE fundamental_ratios ADD COLUMN IF NOT EXISTS ranking_status TEXT;
 -- valores possíveis: 'ok' | 'reprovado_piotroski' | 'piotroski_desconhecido' | 'dados_insuficientes'
+
+-- Segunda versão do ranking, calculada só entre quem passa no filtro de
+-- qualidade (Piotroski) - o percentil aqui é relativo aos pares já filtrados,
+-- não ao universo inteiro. Use esta versão pra buy & hold (qualidade importa);
+-- use composite_percentile/composite_rank (sem filtro) pra swing trade.
+ALTER TABLE fundamental_ratios ADD COLUMN IF NOT EXISTS composite_percentile_quality NUMERIC;
+ALTER TABLE fundamental_ratios ADD COLUMN IF NOT EXISTS composite_rank_quality       INTEGER;
