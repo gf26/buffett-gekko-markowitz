@@ -57,6 +57,8 @@ SELECT
     fr.roe_pct,
     fr.composite_percentile,
     fr.composite_rank,
+    fr.composite_percentile_quality,
+    fr.composite_rank_quality,
     fr.ranking_status
 FROM tickers t
 LEFT JOIN fundamental_ratios fr ON fr.ticker = t.ticker
