@@ -56,7 +56,8 @@ SELECT
     fr.peer_group,
     fr.roe_pct,
     fr.composite_percentile,
-    fr.composite_rank
+    fr.composite_rank,
+    fr.ranking_status
 FROM tickers t
 LEFT JOIN fundamental_ratios fr ON fr.ticker = t.ticker
 LEFT JOIN market_metrics mm     ON mm.ticker = t.ticker
