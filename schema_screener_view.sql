@@ -1,11 +1,13 @@
 -- View "screener": junta índices fundamentalistas + indicadores de mercado
 -- numa única planilha, uma linha por ticker.
 --
--- Esta versão só ACRESCENTA colunas no final (Magic Formula, Gross
--- Profitability, ranking composto por percentil) - não precisa de DROP VIEW,
--- CREATE OR REPLACE funciona direto.
+-- Se a lista de colunas mudar de posição (não só acrescentar no final), o
+-- Postgres recusa o CREATE OR REPLACE - por isso o DROP VIEW abaixo. É
+-- seguro: views não guardam dado, só a definição da consulta.
 
-CREATE OR REPLACE VIEW vw_screener AS
+DROP VIEW IF EXISTS vw_screener;
+
+CREATE VIEW vw_screener AS
 SELECT
     t.ticker,
     t.name,
