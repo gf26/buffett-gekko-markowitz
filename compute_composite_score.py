@@ -19,6 +19,13 @@ Sector classification comes from company_info->>'sector' (Yahoo Finance's
 own sector labels), not from which balance sheet fields happen to be
 present - more reliable than inferring it from data gaps.
 
+Every ticker with sufficient data gets a composite_percentile/composite_rank,
+regardless of Piotroski F-Score. 'ranking_status' is purely informational:
+'ok' if F-Score >= PIOTROSKI_MIN_SCORE, 'reprovado_piotroski' if it's below
+that but the ticker still got ranked, 'dados_insuficientes' if there wasn't
+enough data to rank it at all. Filter on ranking_status yourself if/when you
+want to exclude low-quality names from what you're looking at.
+
 Usage:
     DATABASE_URL="postgresql://..." python compute_composite_score.py
 """
@@ -67,27 +74,26 @@ def classify_and_score(df):
     df["ranking_status"] = "dados_insuficientes"
 
     passed_gate = df["piotroski_f_score"] >= PIOTROSKI_MIN_SCORE
-    # quem tem os dados de valuation/qualidade mas não passou no F-Score fica marcado,
-    # em vez de cair no genérico "dados_insuficientes"
-    has_metrics = (
-        df[["earnings_yield_pct", "return_on_capital_pct"]].notna().all(axis=1)
-        | df[["roe_pct", "price_to_book"]].notna().all(axis=1)
-    )
-    df.loc[has_metrics & df["piotroski_f_score"].notna() & ~passed_gate, "ranking_status"] = "reprovado_piotroski"
 
-    geral = df[(df["peer_group"] == "geral") & passed_gate].dropna(subset=["earnings_yield_pct", "return_on_capital_pct"])
+    geral = df[df["peer_group"] == "geral"].dropna(subset=["earnings_yield_pct", "return_on_capital_pct"])
     if not geral.empty:
         ey_pct = geral["earnings_yield_pct"].rank(pct=True)
         roc_pct = geral["return_on_capital_pct"].rank(pct=True)
         df.loc[geral.index, "composite_percentile"] = ((ey_pct + roc_pct) / 2 * 100).round(1)
-        df.loc[geral.index, "ranking_status"] = "ok"
 
-    fin = df[(df["peer_group"] == "financeiro_utility") & passed_gate].dropna(subset=["roe_pct", "price_to_book"])
+    fin = df[df["peer_group"] == "financeiro_utility"].dropna(subset=["roe_pct", "price_to_book"])
     if not fin.empty:
         roe_pct = fin["roe_pct"].rank(pct=True)
         pb_pct = fin["price_to_book"].rank(pct=True, ascending=False)  # lower P/B = better
         df.loc[fin.index, "composite_percentile"] = ((roe_pct + pb_pct) / 2 * 100).round(1)
-        df.loc[fin.index, "ranking_status"] = "ok"
+
+    # ranking_status é só informativo agora - não afeta quem entra no ranking,
+    # todo ticker com métricas suficientes recebe composite_percentile/rank.
+    has_score = df["composite_percentile"].notna()
+    has_piotroski = df["piotroski_f_score"].notna()
+    df.loc[has_score & has_piotroski & passed_gate, "ranking_status"] = "ok"
+    df.loc[has_score & has_piotroski & ~passed_gate, "ranking_status"] = "reprovado_piotroski"
+    df.loc[has_score & ~has_piotroski, "ranking_status"] = "piotroski_desconhecido"
 
     ranked = df.dropna(subset=["composite_percentile"])
     df["composite_rank"] = ranked["composite_percentile"].rank(ascending=False, method="min")
