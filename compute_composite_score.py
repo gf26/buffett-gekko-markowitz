@@ -63,6 +63,27 @@ def load_data():
 PIOTROSKI_MIN_SCORE = 7
 
 
+def _percentile_score(group_df):
+    """Given a peer-group subset (already filtered to the right rows), returns
+    a Series of composite percentiles (0-100, higher=better) indexed the same
+    way, using EY+ROC for 'geral' rows and ROE+P/B for 'financeiro_utility' rows."""
+    scores = pd.Series(index=group_df.index, dtype=float)
+
+    geral = group_df[group_df["peer_group"] == "geral"].dropna(subset=["earnings_yield_pct", "return_on_capital_pct"])
+    if not geral.empty:
+        ey_pct = geral["earnings_yield_pct"].rank(pct=True)
+        roc_pct = geral["return_on_capital_pct"].rank(pct=True)
+        scores.loc[geral.index] = ((ey_pct + roc_pct) / 2 * 100).round(1)
+
+    fin = group_df[group_df["peer_group"] == "financeiro_utility"].dropna(subset=["roe_pct", "price_to_book"])
+    if not fin.empty:
+        roe_pct = fin["roe_pct"].rank(pct=True)
+        pb_pct = fin["price_to_book"].rank(pct=True, ascending=False)  # lower P/B = better
+        scores.loc[fin.index] = ((roe_pct + pb_pct) / 2 * 100).round(1)
+
+    return scores
+
+
 def classify_and_score(df):
     df["peer_group"] = df["sector"].apply(
         lambda s: "financeiro_utility" if s in FINANCEIRO_UTILITY_SECTORS else "geral"
@@ -70,33 +91,28 @@ def classify_and_score(df):
     df["roe_pct"] = ((df["net_earnings"] / df["book_value"]) * 100).round(2)
     df.loc[df["book_value"].isna() | (df["book_value"] == 0), "roe_pct"] = None
 
-    df["composite_percentile"] = None
-    df["ranking_status"] = "dados_insuficientes"
-
     passed_gate = df["piotroski_f_score"] >= PIOTROSKI_MIN_SCORE
 
-    geral = df[df["peer_group"] == "geral"].dropna(subset=["earnings_yield_pct", "return_on_capital_pct"])
-    if not geral.empty:
-        ey_pct = geral["earnings_yield_pct"].rank(pct=True)
-        roc_pct = geral["return_on_capital_pct"].rank(pct=True)
-        df.loc[geral.index, "composite_percentile"] = ((ey_pct + roc_pct) / 2 * 100).round(1)
+    # Versão 1: sem filtro de qualidade - bom pra swing trade.
+    df["composite_percentile"] = _percentile_score(df)
+    ranked_all = df.dropna(subset=["composite_percentile"])
+    df["composite_rank"] = ranked_all["composite_percentile"].rank(ascending=False, method="min")
 
-    fin = df[df["peer_group"] == "financeiro_utility"].dropna(subset=["roe_pct", "price_to_book"])
-    if not fin.empty:
-        roe_pct = fin["roe_pct"].rank(pct=True)
-        pb_pct = fin["price_to_book"].rank(pct=True, ascending=False)  # lower P/B = better
-        df.loc[fin.index, "composite_percentile"] = ((roe_pct + pb_pct) / 2 * 100).round(1)
+    # Versão 2: só entre quem passa no F-Score - percentil relativo aos pares
+    # já filtrados por qualidade. Bom pra buy & hold.
+    df["composite_percentile_quality"] = _percentile_score(df[passed_gate])
+    ranked_quality = df.dropna(subset=["composite_percentile_quality"])
+    df["composite_rank_quality"] = ranked_quality["composite_percentile_quality"].rank(ascending=False, method="min")
 
-    # ranking_status é só informativo agora - não afeta quem entra no ranking,
-    # todo ticker com métricas suficientes recebe composite_percentile/rank.
+    # ranking_status é informativo - explica por que um ticker não tem
+    # composite_percentile_quality, sem afetar composite_percentile (sem filtro).
+    df["ranking_status"] = "dados_insuficientes"
     has_score = df["composite_percentile"].notna()
     has_piotroski = df["piotroski_f_score"].notna()
     df.loc[has_score & has_piotroski & passed_gate, "ranking_status"] = "ok"
     df.loc[has_score & has_piotroski & ~passed_gate, "ranking_status"] = "reprovado_piotroski"
     df.loc[has_score & ~has_piotroski, "ranking_status"] = "piotroski_desconhecido"
 
-    ranked = df.dropna(subset=["composite_percentile"])
-    df["composite_rank"] = ranked["composite_percentile"].rank(ascending=False, method="min")
     return df
 
 
@@ -115,6 +131,7 @@ def update_scores(df):
                 UPDATE fundamental_ratios SET
                     peer_group = :pg, roe_pct = :roe,
                     composite_percentile = :cp, composite_rank = :cr,
+                    composite_percentile_quality = :cpq, composite_rank_quality = :crq,
                     ranking_status = :status
                 WHERE ticker = :t
             """), {
@@ -122,6 +139,8 @@ def update_scores(df):
                 "roe": as_float(row["roe_pct"]),
                 "cp": as_float(row["composite_percentile"]),
                 "cr": as_int(row["composite_rank"]),
+                "cpq": as_float(row["composite_percentile_quality"]),
+                "crq": as_int(row["composite_rank_quality"]),
                 "status": row["ranking_status"],
                 "t": ticker,
             })
