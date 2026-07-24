@@ -43,11 +43,17 @@ def load_data():
                 fr.book_value,
                 fr.price_to_book,
                 fr.earnings_yield_pct,
-                fr.return_on_capital_pct
+                fr.return_on_capital_pct,
+                fr.piotroski_f_score
             FROM fundamental_ratios fr
             LEFT JOIN company_info ci ON ci.ticker = fr.ticker
         """), conn)
     return df.set_index("ticker")
+
+
+# F-Score mínimo pra "entrar" no ranking (0-9). 7+ é um corte de qualidade
+# comum na prática - ajuste aqui se quiser mais ou menos rigoroso.
+PIOTROSKI_MIN_SCORE = 7
 
 
 def classify_and_score(df):
@@ -58,18 +64,30 @@ def classify_and_score(df):
     df.loc[df["book_value"].isna() | (df["book_value"] == 0), "roe_pct"] = None
 
     df["composite_percentile"] = None
+    df["ranking_status"] = "dados_insuficientes"
 
-    geral = df[df["peer_group"] == "geral"].dropna(subset=["earnings_yield_pct", "return_on_capital_pct"])
+    passed_gate = df["piotroski_f_score"] >= PIOTROSKI_MIN_SCORE
+    # quem tem os dados de valuation/qualidade mas não passou no F-Score fica marcado,
+    # em vez de cair no genérico "dados_insuficientes"
+    has_metrics = (
+        df[["earnings_yield_pct", "return_on_capital_pct"]].notna().all(axis=1)
+        | df[["roe_pct", "price_to_book"]].notna().all(axis=1)
+    )
+    df.loc[has_metrics & df["piotroski_f_score"].notna() & ~passed_gate, "ranking_status"] = "reprovado_piotroski"
+
+    geral = df[(df["peer_group"] == "geral") & passed_gate].dropna(subset=["earnings_yield_pct", "return_on_capital_pct"])
     if not geral.empty:
         ey_pct = geral["earnings_yield_pct"].rank(pct=True)
         roc_pct = geral["return_on_capital_pct"].rank(pct=True)
         df.loc[geral.index, "composite_percentile"] = ((ey_pct + roc_pct) / 2 * 100).round(1)
+        df.loc[geral.index, "ranking_status"] = "ok"
 
-    fin = df[df["peer_group"] == "financeiro_utility"].dropna(subset=["roe_pct", "price_to_book"])
+    fin = df[(df["peer_group"] == "financeiro_utility") & passed_gate].dropna(subset=["roe_pct", "price_to_book"])
     if not fin.empty:
         roe_pct = fin["roe_pct"].rank(pct=True)
         pb_pct = fin["price_to_book"].rank(pct=True, ascending=False)  # lower P/B = better
         df.loc[fin.index, "composite_percentile"] = ((roe_pct + pb_pct) / 2 * 100).round(1)
+        df.loc[fin.index, "ranking_status"] = "ok"
 
     ranked = df.dropna(subset=["composite_percentile"])
     df["composite_rank"] = ranked["composite_percentile"].rank(ascending=False, method="min")
@@ -90,13 +108,15 @@ def update_scores(df):
             conn.execute(text("""
                 UPDATE fundamental_ratios SET
                     peer_group = :pg, roe_pct = :roe,
-                    composite_percentile = :cp, composite_rank = :cr
+                    composite_percentile = :cp, composite_rank = :cr,
+                    ranking_status = :status
                 WHERE ticker = :t
             """), {
                 "pg": row["peer_group"],
                 "roe": as_float(row["roe_pct"]),
                 "cp": as_float(row["composite_percentile"]),
                 "cr": as_int(row["composite_rank"]),
+                "status": row["ranking_status"],
                 "t": ticker,
             })
 
@@ -108,9 +128,9 @@ def main():
 
     n_geral = (df["peer_group"] == "geral").sum()
     n_fin = (df["peer_group"] == "financeiro_utility").sum()
-    n_ranked = df["composite_percentile"].notna().sum()
     print(f"  {n_geral} no grupo 'geral', {n_fin} no grupo 'financeiro_utility'")
-    print(f"  {n_ranked} entraram no ranking (tinham os dados necessários)")
+    for status, count in df["ranking_status"].value_counts().items():
+        print(f"  {status}: {count}")
 
     update_scores(df)
     print("Done.")
