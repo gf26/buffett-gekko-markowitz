@@ -40,6 +40,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import requests
 from sqlalchemy import create_engine, text
 
 TRADING_DAYS_PER_YEAR = 252
@@ -47,6 +48,25 @@ DEFAULT_N_PORTFOLIOS = 30_000
 DEFAULT_LOOKBACK_DAYS = 756  # ~3 anos de pregão, mesma janela do compute_market_metrics.py
 MIN_TICKERS = 2
 MAX_TICKERS = 30  # sanity limit - isso não é pensado para centenas de ativos de uma vez
+BCB_SELIC_META_SERIES = 432  # Meta Selic definida pelo Copom, % a.a. - api.bcb.gov.br (SGS)
+IBOVESPA_TICKER = "^BVSP"
+
+
+def fetch_selic_rate_anual(default=0.0):
+    """Busca a Selic meta atual (% ao ano) via API pública do Banco Central
+    (SGS, série 432) e devolve como decimal (ex: 0.15 para 15% a.a.). Se a
+    chamada falhar (sem internet, API fora do ar), devolve `default` e avisa
+    - não trava a simulação por causa disso."""
+    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{BCB_SELIC_META_SERIES}/dados/ultimos/1?formato=json"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        valor_pct = float(data[0]["valor"])
+        return valor_pct / 100
+    except Exception as e:
+        print(f"Aviso: não consegui buscar a Selic no Banco Central ({e}). Usando {default*100:.1f}% a.a. como taxa livre de risco.")
+        return default
 
 
 def load_returns(engine, tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
@@ -123,6 +143,29 @@ def run_simulation(returns, n_portfolios=DEFAULT_N_PORTFOLIOS, risk_free_rate_an
     return pd.concat([results, weights], axis=1)
 
 
+def load_single_ticker_returns(engine, ticker, lookback_days=DEFAULT_LOOKBACK_DAYS):
+    with engine.connect() as conn:
+        df = pd.read_sql(text("""
+            SELECT date, adj_close FROM prices_daily
+            WHERE ticker = :t AND adj_close IS NOT NULL
+            ORDER BY date
+        """), conn, params={"t": ticker})
+    if df.empty:
+        return None
+    prices = df.set_index("date")["adj_close"].tail(lookback_days)
+    return np.log(prices / prices.shift(1)).dropna()
+
+
+def compute_benchmark_ann_return_pct(engine, lookback_days=DEFAULT_LOOKBACK_DAYS, benchmark_ticker=IBOVESPA_TICKER):
+    """Retorno anualizado do Ibovespa na mesma janela e com a mesma convenção
+    (média do log-retorno diário * 252) usada para os portfólios simulados -
+    para comparação direta, "maçã com maçã"."""
+    r = load_single_ticker_returns(engine, benchmark_ticker, lookback_days)
+    if r is None or r.empty:
+        return None
+    return float(r.mean() * TRADING_DAYS_PER_YEAR * 100)
+
+
 def find_optimal_portfolios(results, tickers):
     """Extrai os 4 portfólios de destaque: maior retorno, menor volatilidade,
     maior Sharpe, maior Sortino."""
@@ -193,12 +236,20 @@ def main():
         sys.exit(1)
 
     engine = create_engine(os.environ["DATABASE_URL"])
-    print(f"Carregando histórico de preços para {len(tickers)} tickers...")
+
+    selic = fetch_selic_rate_anual()
+    print(f"Selic meta atual (Banco Central): {selic*100:.2f}% a.a. - usando como taxa livre de risco.")
+
+    ibov_ann_return_pct = compute_benchmark_ann_return_pct(engine)
+    if ibov_ann_return_pct is not None:
+        print(f"Ibovespa no mesmo período: {ibov_ann_return_pct:.2f}% a.a. (retorno anualizado, mesma janela/convenção dos portfólios abaixo).")
+
+    print(f"\nCarregando histórico de preços para {len(tickers)} tickers...")
     returns = load_returns(engine, tickers)
     print(f"  {returns.shape[0]} dias de pregão, {returns.shape[1]} tickers utilizáveis.")
 
     print(f"Rodando {DEFAULT_N_PORTFOLIOS:,} simulações...")
-    results = run_simulation(returns, n_portfolios=DEFAULT_N_PORTFOLIOS)
+    results = run_simulation(returns, n_portfolios=DEFAULT_N_PORTFOLIOS, risk_free_rate_annual=selic)
 
     best = find_optimal_portfolios(results, list(returns.columns))
     for name, info in best.items():
@@ -210,6 +261,9 @@ def main():
         print(f"  volatilidade anualizada: {info['ann_vol_pct']}%")
         print(f"  Sharpe: {info['sharpe']}")
         print(f"  Sortino: {info['sortino']}")
+        print(f"  vs. Selic ({selic*100:.2f}%): {info['ann_return_pct'] - selic*100:+.2f} p.p.")
+        if ibov_ann_return_pct is not None:
+            print(f"  vs. Ibovespa ({ibov_ann_return_pct:.2f}%): {info['ann_return_pct'] - ibov_ann_return_pct:+.2f} p.p.")
         weights_sorted = sorted(info["weights_pct"].items(), key=lambda x: -x[1])
         for ticker, w in weights_sorted:
             if w >= 0.5:
