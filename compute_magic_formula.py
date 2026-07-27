@@ -96,6 +96,7 @@ def load_price_and_dividend_fields(ticker):
 def compute_for_ticker(ticker):
     bs = get_lfy(ticker, "balance_sheet")
     inc = get_lfy(ticker, "income_statement")
+    cf = get_lfy(ticker, "cashflow")
     if bs is None or inc is None:
         return None
 
@@ -108,16 +109,29 @@ def compute_for_ticker(ticker):
     total_assets = g(bs, "Total Assets")
     gross_profit = g(inc, "Gross Profit")
     ebit = g(inc, *EBIT_FIELDS)
+    operating_cash_flow = g(cf, "Operating Cash Flow")
+    capex = g(cf, "Capital Expenditure", "Capital Expenditure Reported", default=0)
 
     result = {"ticker": ticker}
 
-    if market_cap is not None and ebit is not None:
+    enterprise_value = None
+    if market_cap is not None:
         enterprise_value = market_cap + total_debt - cash
         result["enterprise_value"] = round(enterprise_value, 2)
-        result["earnings_yield_pct"] = round(safe_div(ebit, enterprise_value) * 100, 2) if enterprise_value else None
     else:
         result["enterprise_value"] = None
+
+    if enterprise_value and ebit is not None:
+        result["earnings_yield_pct"] = round(safe_div(ebit, enterprise_value) * 100, 2)
+    else:
         result["earnings_yield_pct"] = None
+
+    # capex vem negativo no demonstrativo (é uma saída de caixa) - por isso soma, não subtrai
+    if enterprise_value and operating_cash_flow is not None:
+        fcf = operating_cash_flow + capex
+        result["fcf_yield_pct"] = round(safe_div(fcf, enterprise_value) * 100, 2)
+    else:
+        result["fcf_yield_pct"] = None
 
     if None not in (current_assets, current_liab, net_ppe) and ebit is not None:
         capital_employed = (current_assets - current_liab) + net_ppe
