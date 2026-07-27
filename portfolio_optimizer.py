@@ -40,7 +40,7 @@ import pandas as pd
 import requests
 from scipy.optimize import linprog
 from sqlalchemy import create_engine, text
-from pypfopt import EfficientFrontier
+from pypfopt import EfficientFrontier, objective_functions
 from pypfopt.exceptions import OptimizationError
 
 TRADING_DAYS_PER_YEAR = 252
@@ -142,7 +142,7 @@ def _solve_max_return(mu, min_weight, max_weight):
 
 
 def solve_frontier(returns, risk_free_rate_annual=0.0, min_weight=0.0, max_weight=1.0,
-                    n_frontier_points=DEFAULT_N_FRONTIER_POINTS):
+                    n_frontier_points=DEFAULT_N_FRONTIER_POINTS, l2_gamma=0.0):
     """
     Resolve a fronteira eficiente EXATA via otimização convexa (PyPortfolioOpt/
     Markowitz) - em vez de simular portfólios aleatórios, resolve diretamente
@@ -156,13 +156,25 @@ def solve_frontier(returns, risk_free_rate_annual=0.0, min_weight=0.0, max_weigh
     Isso pode "esconder" a carteira numericamente ótima sem restrição, de
     propósito: o objetivo é evitar posições irrelevantes ou concentração
     excessiva num único ativo, não maximizar Sharpe a qualquer custo.
+
+    l2_gamma > 0 adiciona regularização L2 (objective_functions.L2_reg) -
+    penaliza concentração de peso, o que tende a produzir carteiras mais
+    diversificadas e menos "grudadas" nos limites min/max_weight. É uma
+    resposta padrão ao fato de que a otimização média-variância é sensível
+    a erro de estimativa nos retornos esperados e tende a soluções de canto.
+    Não se aplica ao portfólio de maior retorno (esse é uma solução de canto
+    por definição - maximizar retorno sob limites de peso não tem "meio
+    termo" a regularizar).
     """
     tickers = list(returns.columns)
     mu, S = _annualized_mu_sigma(returns)
     bounds = (min_weight, max_weight)
 
     def new_ef():
-        return EfficientFrontier(mu, S, weight_bounds=bounds)
+        ef = EfficientFrontier(mu, S, weight_bounds=bounds)
+        if l2_gamma > 0:
+            ef.add_objective(objective_functions.L2_reg, gamma=l2_gamma)
+        return ef
 
     try:
         ef_minvol = new_ef()
@@ -344,6 +356,42 @@ def select_intermediate_portfolios(frontier, exclude_indices, tickers, n=10):
     return out
 
 
+def plot_portfolio_weights(weights_pct, title="Composição da Carteira", output_path="portfolio_weights.png"):
+    """Gráfico de barras da composição de uma carteira, usando
+    pypfopt.plotting.plot_weights - mais fácil de ler que a lista de texto."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from pypfopt import plotting
+
+    weights_decimal = {t: w / 100 for t, w in weights_pct.items() if w > 0.01}
+    ax = plotting.plot_weights(weights_decimal, showfig=False)
+    ax.set_title(title)
+    fig = ax.get_figure()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def plot_correlation_matrix(returns, output_path="correlation_matrix.png"):
+    """Heatmap de correlação entre os tickers, usando
+    pypfopt.plotting.plot_covariance - ajuda a enxergar quais ativos andam
+    juntos (correlação alta = diversificar entre eles ajuda pouco)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from pypfopt import plotting
+
+    S = returns.cov() * TRADING_DAYS_PER_YEAR
+    ax = plotting.plot_covariance(S, plot_correlation=True, showfig=False)
+    fig = ax.get_figure()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
 def plot_efficient_frontier(frontier, best, risk_free_rate_annual, intermediate=None, output_path="efficient_frontier.png"):
     """Gráfico da fronteira eficiente. Como `frontier` já vem só com pontos
     ótimos resolvidos via otimização convexa (sem nuvem de simulações
@@ -436,6 +484,115 @@ def plot_efficient_frontier(frontier, best, risk_free_rate_annual, intermediate=
     return output_path
 
 
+def load_returns_aligned(engine, ticker, dates):
+    """Retorna os log-retornos diários de um ticker, alinhados ao índice de
+    datas informado (preenchendo com 0 - "sem variação" - onde faltar dado,
+    ex: feriados que não coincidem entre mercados)."""
+    with engine.connect() as conn:
+        df = pd.read_sql(text("""
+            SELECT date, adj_close FROM prices_daily
+            WHERE ticker = :t AND adj_close IS NOT NULL
+              AND date >= :start AND date <= :end
+            ORDER BY date
+        """), conn, params={"t": ticker, "start": dates.min(), "end": dates.max()})
+    if df.empty:
+        return None
+    prices = df.set_index("date")["adj_close"]
+    r = np.log(prices / prices.shift(1)).dropna()
+    return r.reindex(dates).fillna(0.0)
+
+
+def plot_cumulative_performance(returns, best, intermediate, ibov_returns, selic_annual,
+                                 output_path="cumulative_returns.png"):
+    """Gráfico de retorno acumulado (a partir do preço ajustado) ao longo do
+    período analisado. Hierarquia de foco visual, do mais discreto ao mais
+    destacado:
+    1. cada ticker individual - fundo, apagado
+    2. soluções intermediárias da fronteira - segundo plano
+    3. Selic e Ibovespa (referências) - destaque
+    4. portfólios campeões - destaque máximo
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update({
+        "font.size": 11,
+        "axes.edgecolor": "#444444",
+        "axes.labelcolor": "#222222",
+        "text.color": "#222222",
+        "axes.titleweight": "bold",
+    })
+
+    dates = returns.index
+    tickers = list(returns.columns)
+
+    def cumulative_pct(daily_returns_array):
+        return (np.exp(np.cumsum(daily_returns_array)) - 1) * 100
+
+    fig, ax = plt.subplots(figsize=(12, 7.5))
+    ax.set_facecolor("#fbfbfb")
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    ax.grid(True, color="#e3e3e3", linewidth=0.8, zorder=0)
+
+    # 1. fundo: cada ticker individual
+    for t in tickers:
+        cum = cumulative_pct(returns[t].to_numpy())
+        ax.plot(dates, cum, color="#c9c9c9", linewidth=0.8, alpha=0.55, zorder=1)
+    if tickers:
+        ax.plot([], [], color="#c9c9c9", linewidth=1.5, label="Tickers individuais")
+
+    # 2. segundo plano: soluções intermediárias
+    for i, p in enumerate(intermediate or []):
+        w = np.array([p["weights_pct"].get(t, 0.0) / 100 for t in tickers])
+        cum = cumulative_pct(returns.to_numpy() @ w)
+        ax.plot(dates, cum, color="#7fa8d1", linewidth=1.1, alpha=0.7, zorder=2)
+    if intermediate:
+        ax.plot([], [], color="#7fa8d1", linewidth=1.5, label="Soluções intermediárias")
+
+    # 3. destaque: Selic e Ibovespa
+    daily_rf = (1 + selic_annual) ** (1 / TRADING_DAYS_PER_YEAR) - 1
+    cum_rf = ((1 + daily_rf) ** np.arange(1, len(dates) + 1) - 1) * 100
+    ax.plot(dates, cum_rf, color="#888888", linewidth=2, linestyle="--", zorder=3,
+            label=f"Selic ({selic_annual*100:.2f}% a.a.)")
+
+    if ibov_returns is not None:
+        cum_ibov = cumulative_pct(ibov_returns.to_numpy())
+        ax.plot(dates, cum_ibov, color="#222222", linewidth=2, zorder=3, label="Ibovespa")
+
+    # 4. destaque máximo: campeões (agrupando quem coincide)
+    champion_style = {
+        "maior_retorno": ("Maior retorno", "#d62728"),
+        "menor_volatilidade": ("Menor volatilidade", "#1f9e5c"),
+        "maior_sharpe": ("Maior Sharpe", "#e0a400"),
+        "maior_sortino": ("Maior Sortino", "#9b4fd1"),
+    }
+    grouped = {}
+    for key, info in best.items():
+        if info is None:
+            continue
+        grouped.setdefault(info["index"], []).append(key)
+
+    for idx, keys in grouped.items():
+        info = best[keys[0]]
+        labels = [champion_style[k][0] for k in keys]
+        color = champion_style[keys[0]][1] if len(keys) == 1 else "#c2185b"
+        w = np.array([info["weights_pct"].get(t, 0.0) / 100 for t in tickers])
+        cum = cumulative_pct(returns.to_numpy() @ w)
+        ax.plot(dates, cum, color=color, linewidth=2.4, zorder=4, label=" & ".join(labels))
+
+    ax.set_xlabel("Data")
+    ax.set_ylabel("Retorno acumulado (%)")
+    ax.set_title("Retorno Acumulado no Período Analisado", loc="left", fontsize=14)
+    ax.legend(loc="upper left", frameon=False, fontsize=9)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
 def parse_args():
     import argparse
 
@@ -451,6 +608,9 @@ def parse_args():
                          help="Peso MÁXIMO por ativo, em %% (ex: 35 para 35%%). Padrão: 100 (sem máximo).")
     parser.add_argument("--n-frontier-points", type=int, default=DEFAULT_N_FRONTIER_POINTS,
                          help=f"Quantos pontos resolver ao longo da fronteira eficiente. Padrão: {DEFAULT_N_FRONTIER_POINTS}.")
+    parser.add_argument("--l2-gamma", type=float, default=0.0,
+                         help="Regularização L2 (0 = desligada). Valores tipo 0.1-1 tendem a espalhar mais "
+                              "os pesos, reduzindo carteiras 'grudadas' nos limites min/max-weight.")
     parser.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS,
                          help=f"Quantos dias de pregão usar no histórico. Padrão: {DEFAULT_LOOKBACK_DAYS} (~3 anos).")
     parser.add_argument("--risk-free-rate", type=float, default=None,
@@ -499,8 +659,10 @@ def main():
     print(f"  {returns.shape[0]} dias de pregão, {returns.shape[1]} tickers utilizáveis.")
 
     print(f"\nResolvendo a fronteira eficiente ({args.n_frontier_points} pontos, via otimização convexa)...")
+    if args.l2_gamma > 0:
+        print(f"  regularização L2 ativada (gamma={args.l2_gamma}) - deve reduzir concentração nos limites de peso.")
     frontier = solve_frontier(returns, risk_free_rate_annual=selic, min_weight=min_weight, max_weight=max_weight,
-                               n_frontier_points=args.n_frontier_points)
+                               n_frontier_points=args.n_frontier_points, l2_gamma=args.l2_gamma)
 
     tickers_usados = list(returns.columns)
     best = find_optimal_portfolios(frontier, tickers_usados)
@@ -552,7 +714,21 @@ def main():
             print(f"    {top_holdings}")
 
     chart_path = plot_efficient_frontier(frontier, best, selic, intermediate=intermediate)
-    print(f"\nGráfico salvo em: {chart_path}")
+    print(f"\nGráfico da fronteira salvo em: {chart_path}")
+
+    ibov_returns = load_returns_aligned(engine, IBOVESPA_TICKER, returns.index)
+    cum_chart_path = plot_cumulative_performance(returns, best, intermediate, ibov_returns, selic)
+    print(f"Gráfico de retorno acumulado salvo em: {cum_chart_path}")
+
+    corr_chart_path = plot_correlation_matrix(returns)
+    print(f"Gráfico de correlação salvo em: {corr_chart_path}")
+
+    for name, info in best.items():
+        if info is None:
+            continue
+        weights_path = plot_portfolio_weights(info["weights_pct"], title=f"Composição - {name}",
+                                               output_path=f"weights_{name}.png")
+        print(f"Gráfico de composição ({name}) salvo em: {weights_path}")
 
 
 if __name__ == "__main__":
