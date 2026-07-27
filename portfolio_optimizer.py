@@ -1,36 +1,34 @@
 """
-Etapa 3: Otimizador de Portfólio (Monte Carlo vetorizado).
+Etapa 3: Otimizador de Portfólio (otimização convexa via PyPortfolioOpt).
 
-Reconstrói a lógica do Buffet_Gekko_v8_Portfolio.ipynb original (pesos
-aleatórios, fronteira eficiente), mas sem o loop Python de 1 milhão de
-iterações - aqui é tudo álgebra matricial em NumPy, o que permite rodar
-dezenas de milhares de simulações em menos de 1 segundo. Isso importa porque
-a ideia é que o futuro app chame isso ao vivo, toda vez que o usuário mudar
-os tickers ou os parâmetros (não é um job agendado como os scripts de coleta
-e cálculo de índices).
+Resolve a fronteira eficiente EXATAMENTE, via otimização convexa (a mesma
+formulação clássica de Markowitz, resolvida como um problema de programação
+quadrática) - em vez de gerar milhares de portfólios aleatórios na esperança
+de que alguns caiam perto da fronteira. Isso é mais rápido, mais preciso, e
+não deixa "buracos" na curva por falta de sorte na amostragem.
 
 Este arquivo é uma BIBLIOTECA (funções reutilizáveis), não um job agendado -
 não precisa de workflow no GitHub Actions. O bloco no final (`if __name__ ==
 "__main__"`) é só para testar manualmente pelo terminal.
 
-Convenção de cálculo (Markowitz clássico):
+Convenção de cálculo:
 - Retorno esperado anualizado = média diária dos LOG-retornos * 252
 - Volatilidade anualizada = raiz(variância diária * 252), variância via
-  matriz de covariância (W' Σ W)
+  matriz de covariância (W' Σ W) - resolvido pelo PyPortfolioOpt
 - Sharpe = (retorno anualizado - taxa livre de risco) / volatilidade
-- Sortino: usa semi-desvio (só a parte negativa do retorno de cada
-  simulação, elevada ao quadrado, média sobre TODOS os dias - não só os
-  negativos). É uma convenção um pouco diferente da usada em
-  compute_market_metrics.py (que soma só os dias negativos e divide pela
-  contagem deles) - aqui usei a versão vetorizável para rodar em massa; as
-  duas são convenções legítimas e amplamente usadas, só não são idênticas
-  numericamente.
+- Sortino: (retorno anualizado - taxa livre de risco) / semi-desvio, onde o
+  semi-desvio usa só a parte negativa do retorno diário do portfólio,
+  elevada ao quadrado, média sobre TODOS os dias (não só os negativos) -
+  calculado empiricamente a partir do histórico real para cada ponto da
+  fronteira (PyPortfolioOpt não expõe Sortino nativamente para o problema
+  média-variância, então o maior Sortino é escolhido dentre os pontos já
+  resolvidos na fronteira, não por uma otimização separada).
 
 Usage (como biblioteca, dentro de outro script ou de um notebook):
-    from portfolio_optimizer import load_returns, run_simulation, find_optimal_portfolios
+    from portfolio_optimizer import load_returns, solve_frontier, find_optimal_portfolios
     returns = load_returns(engine, ["PETR4.SA", "VALE3.SA", ...])
-    results = run_simulation(returns, n_portfolios=30000)
-    best = find_optimal_portfolios(results, list(returns.columns))
+    frontier = solve_frontier(returns, risk_free_rate_annual=0.15, min_weight=0.02, max_weight=0.35)
+    best = find_optimal_portfolios(frontier, list(returns.columns))
 
 Usage (teste manual pelo terminal):
     DATABASE_URL="postgresql://..." python portfolio_optimizer.py PETR4.SA VALE3.SA ITUB4.SA WEGE3.SA
@@ -40,10 +38,13 @@ import os
 import numpy as np
 import pandas as pd
 import requests
+from scipy.optimize import linprog
 from sqlalchemy import create_engine, text
+from pypfopt import EfficientFrontier
+from pypfopt.exceptions import OptimizationError
 
 TRADING_DAYS_PER_YEAR = 252
-DEFAULT_N_PORTFOLIOS = 30_000
+DEFAULT_N_FRONTIER_POINTS = 50  # quantos pontos resolver ao longo da fronteira
 DEFAULT_LOOKBACK_DAYS = 756  # ~3 anos de pregão, mesma janela do compute_market_metrics.py
 MIN_TICKERS = 2
 MAX_TICKERS = 30  # sanity limit - isso não é pensado para centenas de ativos de uma vez
@@ -105,102 +106,116 @@ def load_returns(engine, tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
     return returns
 
 
-def _validate_weight_bounds(n_assets, min_weight, max_weight):
-    if not (0 <= min_weight <= max_weight <= 1):
-        raise ValueError("É preciso que 0 <= min_weight <= max_weight <= 1.")
-    if min_weight * n_assets > 1.0 + 1e-9:
-        raise ValueError(
-            f"min_weight={min_weight:.1%} × {n_assets} ativos > 100% - impossível "
-            f"garantir esse mínimo para todos os ativos ao mesmo tempo. Reduza o "
-            f"mínimo ou inclua mais ativos."
-        )
-    if max_weight * n_assets < 1.0 - 1e-9:
-        raise ValueError(
-            f"max_weight={max_weight:.1%} × {n_assets} ativos < 100% - impossível "
-            f"chegar a 100% respeitando esse teto. Aumente o máximo ou inclua mais ativos."
-        )
+def _annualized_mu_sigma(returns):
+    """mu: retorno médio anualizado por ativo (pd.Series). S: matriz de
+    covariância anualizada (pd.DataFrame). Convenção consistente com o resto
+    do projeto (log-retornos diários * 252)."""
+    mu = returns.mean() * TRADING_DAYS_PER_YEAR
+    S = returns.cov() * TRADING_DAYS_PER_YEAR
+    return mu, S
 
 
-def _sample_constrained_weights(n_assets, n_portfolios, min_weight, max_weight, rng, max_attempts_multiplier=200):
-    """Gera pesos aleatórios somando 1, respeitando min_weight <= peso <= max_weight
-    por ativo, via amostragem por rejeição (mantém a amostra estatisticamente
-    correta - uniforme sobre a região viável - em vez de uma fórmula customizada
-    que poderia enviesar os resultados sem se perceber)."""
-    if min_weight <= 0.0 and max_weight >= 1.0:
-        return rng.dirichlet(np.ones(n_assets), size=n_portfolios)
-
-    _validate_weight_bounds(n_assets, min_weight, max_weight)
-
-    accepted_batches = []
-    n_accepted = 0
-    total_generated = 0
-    batch_size = max(n_portfolios, 5000)
-    max_total = n_portfolios * max_attempts_multiplier
-
-    while n_accepted < n_portfolios and total_generated < max_total:
-        batch = rng.dirichlet(np.ones(n_assets), size=batch_size)
-        mask = np.all((batch >= min_weight) & (batch <= max_weight), axis=1)
-        valid = batch[mask]
-        accepted_batches.append(valid)
-        n_accepted += len(valid)
-        total_generated += batch_size
-
-    W = np.vstack(accepted_batches) if accepted_batches else np.empty((0, n_assets))
-    acceptance_rate = len(W) / total_generated if total_generated else 0
-    print(f"  restrição de peso: {acceptance_rate:.1%} dos portfólios gerados respeitavam os limites "
-          f"({len(W):,} válidos de {total_generated:,} tentados)")
-
-    if len(W) < n_portfolios:
-        print(f"  aviso: só consegui {len(W):,} portfólios válidos (pedi {n_portfolios:,}) - limites "
-              f"muito apertados para {n_assets} ativos. Considere afrouxar min/max_weight.")
-        return W
-    return W[:n_portfolios]
+def _portfolio_downside_dev_annual(weights, returns):
+    """Semi-desvio anualizado do retorno histórico do portfólio para um dict
+    de pesos {ticker: peso decimal}."""
+    w = np.array([weights.get(t, 0.0) for t in returns.columns])
+    port_returns = returns.to_numpy() @ w
+    downside_sq = np.minimum(port_returns, 0) ** 2
+    return float(np.sqrt(downside_sq.mean() * TRADING_DAYS_PER_YEAR))
 
 
-def run_simulation(returns, n_portfolios=DEFAULT_N_PORTFOLIOS, risk_free_rate_annual=0.0,
-                    min_weight=0.0, max_weight=1.0, seed=None):
-    """Roda a simulação de Monte Carlo vetorizada. Retorna um DataFrame com
-    uma linha por portfólio simulado: retorno/vol/Sharpe/Sortino anualizados
-    + o peso de cada ticker.
+def _solve_max_return(mu, min_weight, max_weight):
+    """Portfólio de maior retorno possível dentro dos limites de peso - sob
+    restrições lineares, isso é só um problema de programação linear (não
+    precisa de otimização quadrática): maximizar mu'w sujeito a soma(w)=1 e
+    min_weight <= w_i <= max_weight."""
+    n = len(mu)
+    res = linprog(
+        c=-mu.to_numpy(),  # linprog minimiza, por isso o sinal negativo
+        A_eq=[np.ones(n)], b_eq=[1],
+        bounds=[(min_weight, max_weight)] * n,
+        method="highs",
+    )
+    if not res.success:
+        raise ValueError(f"Não consegui resolver o portfólio de maior retorno: {res.message}")
+    return dict(zip(mu.index, res.x))
+
+
+def solve_frontier(returns, risk_free_rate_annual=0.0, min_weight=0.0, max_weight=1.0,
+                    n_frontier_points=DEFAULT_N_FRONTIER_POINTS):
+    """
+    Resolve a fronteira eficiente EXATA via otimização convexa (PyPortfolioOpt/
+    Markowitz) - em vez de simular portfólios aleatórios, resolve diretamente
+    os pontos ótimos. Retorna um DataFrame com um ponto por linha (retorno,
+    volatilidade, Sharpe, Sortino, peso de cada ativo), cobrindo do portfólio
+    de menor volatilidade até o de maior retorno possível, sob os limites de
+    peso informados.
 
     min_weight/max_weight (0 a 1, ex: 0.02 e 0.35 para 2%-35%) restringem a
-    alocação por ativo - nenhum portfólio simulado terá um ativo fora dessa
-    faixa. Isso pode "esconder" a carteira numericamente ótima sem restrição,
-    de propósito: o objetivo é evitar posições irrelevantes ou concentração
-    excessiva num único ativo, não necessariamente maximizar Sharpe a
-    qualquer custo."""
-    rng = np.random.default_rng(seed)
+    alocação por ativo - a fronteira só inclui portfólios dentro dessa faixa.
+    Isso pode "esconder" a carteira numericamente ótima sem restrição, de
+    propósito: o objetivo é evitar posições irrelevantes ou concentração
+    excessiva num único ativo, não maximizar Sharpe a qualquer custo.
+    """
     tickers = list(returns.columns)
-    n_assets = len(tickers)
+    mu, S = _annualized_mu_sigma(returns)
+    bounds = (min_weight, max_weight)
 
-    mean_daily = returns.mean().to_numpy()
-    cov_daily = returns.cov().to_numpy()
+    def new_ef():
+        return EfficientFrontier(mu, S, weight_bounds=bounds)
 
-    W = _sample_constrained_weights(n_assets, n_portfolios, min_weight, max_weight, rng)
-    if len(W) == 0:
-        raise ValueError("Nenhum portfólio válido gerado dentro dos limites de peso - afrouxe as restrições.")
+    try:
+        ef_minvol = new_ef()
+        ef_minvol.min_volatility()
+        ret_minvol, vol_minvol, _ = ef_minvol.portfolio_performance(risk_free_rate=risk_free_rate_annual)
+    except OptimizationError as e:
+        raise ValueError(f"Não consegui resolver o portfólio de menor volatilidade - confira se os limites de peso são viáveis: {e}")
 
-    ann_return = (W @ mean_daily) * TRADING_DAYS_PER_YEAR
+    w_maxret = _solve_max_return(mu, min_weight, max_weight)
+    ret_maxret = float(mu.to_numpy() @ np.array([w_maxret[t] for t in tickers]))
+    w_maxret_arr = np.array([w_maxret[t] for t in tickers])
+    vol_maxret = float(np.sqrt(w_maxret_arr @ S.to_numpy() @ w_maxret_arr))
 
-    port_var_daily = np.sum((W @ cov_daily) * W, axis=1)
-    ann_vol = np.sqrt(port_var_daily * TRADING_DAYS_PER_YEAR)
+    if vol_maxret <= vol_minvol:
+        # caso degenerado (ex: só 2 ativos, ou limites muito apertados) - garante 1 ponto útil
+        target_vols = [vol_minvol]
+    else:
+        target_vols = np.linspace(vol_minvol, vol_maxret, n_frontier_points)
 
-    sharpe = (ann_return - risk_free_rate_annual) / ann_vol
+    rows = []
+    for target_vol in target_vols:
+        try:
+            ef = new_ef()
+            ef.efficient_risk(target_vol)
+            weights = ef.clean_weights()
+            ret, vol, _ = ef.portfolio_performance(risk_free_rate=risk_free_rate_annual)
+        except OptimizationError:
+            continue
+        row = {"ann_return_pct": ret * 100, "ann_vol_pct": vol * 100}
+        for t in tickers:
+            row[f"peso_{t}"] = weights.get(t, 0.0) * 100
+        rows.append(row)
 
-    port_returns_series = returns.to_numpy() @ W.T  # (n_dias, n_portfolios)
-    downside_sq_mean = np.minimum(port_returns_series, 0) ** 2
-    downside_dev = np.sqrt(downside_sq_mean.mean(axis=0) * TRADING_DAYS_PER_YEAR)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        sortino = np.where(downside_dev > 0, (ann_return - risk_free_rate_annual) / downside_dev, np.nan)
+    # garante que o ponto de maior retorno (resolvido via LP) sempre aparece,
+    # mesmo se o sweep de efficient_risk não chegar exatamente lá
+    row_maxret = {"ann_return_pct": ret_maxret * 100, "ann_vol_pct": vol_maxret * 100}
+    for t in tickers:
+        row_maxret[f"peso_{t}"] = w_maxret[t] * 100
+    rows.append(row_maxret)
 
-    results = pd.DataFrame({
-        "ann_return_pct": ann_return * 100,
-        "ann_vol_pct": ann_vol * 100,
-        "sharpe": sharpe,
-        "sortino": sortino,
-    })
-    weights = pd.DataFrame(W * 100, columns=[f"peso_{t}" for t in tickers])
-    return pd.concat([results, weights], axis=1)
+    frontier = pd.DataFrame(rows).drop_duplicates(subset=["ann_vol_pct"]).sort_values("ann_vol_pct").reset_index(drop=True)
+
+    rf_pct = risk_free_rate_annual * 100
+    frontier["sharpe"] = (frontier["ann_return_pct"] - rf_pct) / frontier["ann_vol_pct"]
+
+    sortinos = []
+    for _, row in frontier.iterrows():
+        w = {t: row[f"peso_{t}"] / 100 for t in tickers}
+        dd = _portfolio_downside_dev_annual(w, returns)
+        sortinos.append((row["ann_return_pct"] / 100 - risk_free_rate_annual) / dd if dd > 0 else np.nan)
+    frontier["sortino"] = sortinos
+
+    return frontier
 
 
 def discretize_allocation(weights_pct, prices, capital, fractional_market=True):
@@ -304,24 +319,6 @@ def find_optimal_portfolios(results, tickers):
     return out
 
 
-def compute_pareto_frontier(results):
-    """Retorna só os portfólios NÃO-DOMINADOS: nenhum outro portfólio
-    simulado tem retorno >= e volatilidade <= ao mesmo tempo. Isso é a
-    "curva ótima" de verdade - o resto da nuvem é sempre pior que algum
-    ponto da fronteira em pelo menos uma dimensão."""
-    ordered = results.sort_values("ann_vol_pct")
-    returns = ordered["ann_return_pct"].to_numpy()
-    keep = np.empty(len(ordered), dtype=bool)
-    best_so_far = -np.inf
-    for i in range(len(ordered)):
-        if returns[i] > best_so_far:
-            keep[i] = True
-            best_so_far = returns[i]
-        else:
-            keep[i] = False
-    return ordered[keep]
-
-
 def select_intermediate_portfolios(frontier, exclude_indices, tickers, n=10):
     """Escolhe até `n` portfólios da fronteira eficiente, distribuídos
     uniformemente por volatilidade, excluindo os que já são campeões (pra
@@ -347,18 +344,20 @@ def select_intermediate_portfolios(frontier, exclude_indices, tickers, n=10):
     return out
 
 
-def plot_efficient_frontier(results, best, risk_free_rate_annual, intermediate=None, output_path="efficient_frontier.png"):
-    """Gráfico da fronteira eficiente, com foco visual só no que interessa:
-    - nuvem de fundo (dominados ou abaixo da taxa livre de risco): apagada,
-      só para dar contexto de onde vieram as simulações.
-    - fronteira eficiente (não-dominados, acima da taxa livre de risco):
-      linha contínua destacada - a "curva ótima" de verdade.
-    - até 10 pontos intermediários da fronteira: marcadores numerados, para
-      escolher um meio-termo entre os campeões.
+def plot_efficient_frontier(frontier, best, risk_free_rate_annual, intermediate=None, output_path="efficient_frontier.png"):
+    """Gráfico da fronteira eficiente. Como `frontier` já vem só com pontos
+    ótimos resolvidos via otimização convexa (sem nuvem de simulações
+    aleatórias e sem pontos dominados), o gráfico fica naturalmente
+    "zoomado" na região que interessa - não existe mais nada pra apagar ao
+    fundo.
+
+    - fronteira eficiente: linha contínua.
+    - até 10 pontos intermediários: marcadores numerados, para escolher um
+      meio-termo entre os campeões.
     - os 4 campeões (maior retorno, menor vol, maior Sharpe, maior Sortino):
       estrelas grandes, com rótulo. Quando dois campeões coincidem no MESMO
-      portfólio simulado, viram uma estrela só com os dois nomes juntos, em
-      vez de dois marcadores sobrepostos e ilegíveis.
+      portfólio, viram uma estrela só com os dois nomes juntos, em vez de
+      dois marcadores sobrepostos e ilegíveis.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -373,9 +372,6 @@ def plot_efficient_frontier(results, best, risk_free_rate_annual, intermediate=N
     })
 
     rf_pct = risk_free_rate_annual * 100
-    focus_mask = results["ann_return_pct"] > rf_pct
-    frontier = compute_pareto_frontier(results)
-    frontier_focus = frontier[frontier["ann_return_pct"] > rf_pct]
 
     fig, ax = plt.subplots(figsize=(11, 7.5))
     ax.set_facecolor("#fbfbfb")
@@ -383,21 +379,17 @@ def plot_efficient_frontier(results, best, risk_free_rate_annual, intermediate=N
         ax.spines[spine].set_visible(False)
     ax.grid(True, color="#e3e3e3", linewidth=0.8, zorder=0)
 
-    # nuvem de fundo, apagada: tudo que não está em foco (dominado, ou abaixo da taxa livre de risco)
-    background = results[~results.index.isin(frontier_focus.index)]
-    ax.scatter(background["ann_vol_pct"], background["ann_return_pct"],
-               s=5, alpha=0.12, color="#9aa5b1", linewidths=0, zorder=1, label=None)
-
-    # linha de referência: taxa livre de risco
-    ax.axhline(rf_pct, color="#c2c2c2", linestyle="--", linewidth=1, zorder=1)
-    ax.text(results["ann_vol_pct"].max(), rf_pct, f"  Selic ({rf_pct:.2f}%)",
-            color="#888888", fontsize=9, va="center")
-
-    # fronteira eficiente em foco: linha + pontos
-    ax.plot(frontier_focus["ann_vol_pct"], frontier_focus["ann_return_pct"],
+    # fronteira eficiente: linha + pontos
+    ax.plot(frontier["ann_vol_pct"], frontier["ann_return_pct"],
             color="#2f6fb3", linewidth=2, zorder=2, label="Fronteira eficiente")
-    ax.scatter(frontier_focus["ann_vol_pct"], frontier_focus["ann_return_pct"],
+    ax.scatter(frontier["ann_vol_pct"], frontier["ann_return_pct"],
                s=10, color="#2f6fb3", alpha=0.6, zorder=2)
+
+    # linha de referência: taxa livre de risco (só se estiver dentro da faixa visível)
+    if frontier["ann_return_pct"].min() <= rf_pct <= frontier["ann_return_pct"].max():
+        ax.axhline(rf_pct, color="#c2c2c2", linestyle="--", linewidth=1, zorder=1)
+        ax.text(frontier["ann_vol_pct"].max(), rf_pct, f"  Selic ({rf_pct:.2f}%)",
+                color="#888888", fontsize=9, va="center")
 
     # pontos intermediários: numerados
     if intermediate:
@@ -407,7 +399,7 @@ def plot_efficient_frontier(results, best, risk_free_rate_annual, intermediate=N
             ax.annotate(str(n), (p["ann_vol_pct"], p["ann_return_pct"]),
                         ha="center", va="center", fontsize=8, fontweight="bold", color="#2f6fb3", zorder=5)
 
-    # campeões, agrupando quem coincide no mesmo portfólio simulado
+    # campeões, agrupando quem coincide no mesmo portfólio
     champion_style = {
         "maior_retorno": ("Maior retorno", "#d62728"),
         "menor_volatilidade": ("Menor volatilidade", "#1f9e5c"),
@@ -437,6 +429,7 @@ def plot_efficient_frontier(results, best, risk_free_rate_annual, intermediate=N
     ax.set_ylabel("Retorno anualizado (%)")
     ax.set_title("Fronteira Eficiente", loc="left", fontsize=14)
     ax.legend(loc="lower right", frameon=False)
+    ax.margins(x=0.18, y=0.18)  # espaço extra para os rótulos dos campeões não cortarem
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -447,7 +440,7 @@ def parse_args():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Otimizador de portfólio (Monte Carlo vetorizado). Exemplo:\n"
+        description="Otimizador de portfólio (otimização convexa via PyPortfolioOpt). Exemplo:\n"
                      "  python portfolio_optimizer.py PETR4.SA VALE3.SA ITUB4.SA WEGE3.SA --min-weight 2 --max-weight 35",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -456,8 +449,8 @@ def parse_args():
                          help="Peso MÍNIMO por ativo, em %% (ex: 2 para 2%%). Padrão: 0 (sem mínimo).")
     parser.add_argument("--max-weight", type=float, default=100.0,
                          help="Peso MÁXIMO por ativo, em %% (ex: 35 para 35%%). Padrão: 100 (sem máximo).")
-    parser.add_argument("--n-portfolios", type=int, default=DEFAULT_N_PORTFOLIOS,
-                         help=f"Quantas carteiras aleatórias simular. Padrão: {DEFAULT_N_PORTFOLIOS:,}.")
+    parser.add_argument("--n-frontier-points", type=int, default=DEFAULT_N_FRONTIER_POINTS,
+                         help=f"Quantos pontos resolver ao longo da fronteira eficiente. Padrão: {DEFAULT_N_FRONTIER_POINTS}.")
     parser.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS,
                          help=f"Quantos dias de pregão usar no histórico. Padrão: {DEFAULT_LOOKBACK_DAYS} (~3 anos).")
     parser.add_argument("--risk-free-rate", type=float, default=None,
@@ -505,15 +498,14 @@ def main():
     returns = load_returns(engine, args.tickers, lookback_days=args.lookback_days)
     print(f"  {returns.shape[0]} dias de pregão, {returns.shape[1]} tickers utilizáveis.")
 
-    print(f"Rodando {args.n_portfolios:,} simulações...")
-    results = run_simulation(returns, n_portfolios=args.n_portfolios, risk_free_rate_annual=selic,
-                              min_weight=min_weight, max_weight=max_weight)
+    print(f"\nResolvendo a fronteira eficiente ({args.n_frontier_points} pontos, via otimização convexa)...")
+    frontier = solve_frontier(returns, risk_free_rate_annual=selic, min_weight=min_weight, max_weight=max_weight,
+                               n_frontier_points=args.n_frontier_points)
 
     tickers_usados = list(returns.columns)
-    best = find_optimal_portfolios(results, tickers_usados)
+    best = find_optimal_portfolios(frontier, tickers_usados)
     champion_indices = [info["index"] for info in best.values() if info is not None]
 
-    frontier = compute_pareto_frontier(results)
     intermediate = select_intermediate_portfolios(frontier, champion_indices, tickers_usados, n=10)
 
     prices = load_latest_prices(engine, tickers_usados) if args.capital else None
@@ -559,7 +551,7 @@ def main():
             top_holdings = ", ".join(f"{t} {w}%" for t, w in weights_sorted if w >= 1)
             print(f"    {top_holdings}")
 
-    chart_path = plot_efficient_frontier(results, best, selic, intermediate=intermediate)
+    chart_path = plot_efficient_frontier(frontier, best, selic, intermediate=intermediate)
     print(f"\nGráfico salvo em: {chart_path}")
 
 
