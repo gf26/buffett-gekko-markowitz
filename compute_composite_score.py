@@ -1,13 +1,22 @@
 """
-Builds a single composite ranking that's comparable across two different
-peer groups:
+Builds a DEFAULT composite ranking, comparable across two peer groups. This is
+a sensible starting point for browsing the screener directly in Supabase -
+the planned web app will let the user pick which indicators to use and at
+what weights, computed live from the same raw columns this script relies on
+(earnings_yield_pct, fcf_yield_pct, return_on_capital_pct,
+gross_profitability_pct, roe_pct, price_to_book) - nothing extra needs to be
+precomputed here for that; percentile ranking + weighted averaging over a few
+hundred tickers is cheap enough to do on demand.
 
-- 'geral' (most companies): ranked on Earnings Yield + Return on Capital
-  (Magic Formula), already computed by compute_magic_formula.py.
+Peer groups:
+- 'geral' (most companies): 50% valuation (Earnings Yield + FCF Yield,
+  averaged) / 50% quality (Return on Capital + Gross Profitability, averaged).
 - 'financeiro_utility' (Financial Services + Utilities): the Magic Formula's
   "capital employed" concept doesn't fit these sectors, so they're ranked on
-  ROE + Price-to-Book instead - a standard substitute for capital-intensive,
-  regulated, or balance-sheet-driven businesses.
+  ROE (quality) + Price-to-Book (valuation) instead - a standard substitute
+  for capital-intensive, regulated, or balance-sheet-driven businesses. Only
+  one indicator per side for now; add more later if useful, following the
+  same pattern as the 'geral' group.
 
 Within each group, every metric is converted to a PERCENTILE (0-100, higher
 = better) before combining - this is what makes the two groups comparable:
@@ -50,7 +59,9 @@ def load_data():
                 fr.book_value,
                 fr.price_to_book,
                 fr.earnings_yield_pct,
+                fr.fcf_yield_pct,
                 fr.return_on_capital_pct,
+                fr.gross_profitability_pct,
                 fr.piotroski_f_score
             FROM fundamental_ratios fr
             LEFT JOIN company_info ci ON ci.ticker = fr.ticker
@@ -63,17 +74,36 @@ def load_data():
 PIOTROSKI_MIN_SCORE = 7
 
 
+VALUATION_COLS_GERAL = ["earnings_yield_pct", "fcf_yield_pct"]
+QUALITY_COLS_GERAL = ["return_on_capital_pct", "gross_profitability_pct"]
+
+
 def _percentile_score(group_df):
     """Given a peer-group subset (already filtered to the right rows), returns
     a Series of composite percentiles (0-100, higher=better) indexed the same
-    way, using EY+ROC for 'geral' rows and ROE+P/B for 'financeiro_utility' rows."""
+    way.
+
+    'geral': averages whichever of Earnings Yield / FCF Yield are available
+    into a "valuation" percentile, and whichever of Return on Capital / Gross
+    Profitability are available into a "quality" percentile, then averages
+    those two - this keeps the 50/50 valuation-vs-quality balance regardless
+    of how many indicators are present per side (this is exactly the kind of
+    weighting the future app should let the user override - see module
+    docstring).
+
+    'financeiro_utility': ROE (quality) + Price-to-Book (valuation, inverted
+    since lower is better)."""
     scores = pd.Series(index=group_df.index, dtype=float)
 
-    geral = group_df[group_df["peer_group"] == "geral"].dropna(subset=["earnings_yield_pct", "return_on_capital_pct"])
+    geral = group_df[group_df["peer_group"] == "geral"]
     if not geral.empty:
-        ey_pct = geral["earnings_yield_pct"].rank(pct=True)
-        roc_pct = geral["return_on_capital_pct"].rank(pct=True)
-        scores.loc[geral.index] = ((ey_pct + roc_pct) / 2 * 100).round(1)
+        val_pct = geral[VALUATION_COLS_GERAL].rank(pct=True)
+        qual_pct = geral[QUALITY_COLS_GERAL].rank(pct=True)
+        val_score = val_pct.mean(axis=1, skipna=True)
+        qual_score = qual_pct.mean(axis=1, skipna=True)
+        combined = pd.concat([val_score, qual_score], axis=1).mean(axis=1, skipna=True)
+        valid = geral[VALUATION_COLS_GERAL].notna().any(axis=1) & geral[QUALITY_COLS_GERAL].notna().any(axis=1)
+        scores.loc[geral.index[valid]] = (combined[valid] * 100).round(1)
 
     fin = group_df[group_df["peer_group"] == "financeiro_utility"].dropna(subset=["roe_pct", "price_to_book"])
     if not fin.empty:
