@@ -36,7 +36,6 @@ Usage (teste manual pelo terminal):
     DATABASE_URL="postgresql://..." python portfolio_optimizer.py PETR4.SA VALE3.SA ITUB4.SA WEGE3.SA
 """
 import os
-import sys
 
 import numpy as np
 import pandas as pd
@@ -342,29 +341,77 @@ def plot_efficient_frontier(results, best, output_path="efficient_frontier.png")
     return output_path
 
 
-def main():
-    tickers = sys.argv[1:]
-    if not tickers:
-        print("Uso: python portfolio_optimizer.py TICKER1.SA TICKER2.SA ...")
-        sys.exit(1)
+def parse_args():
+    import argparse
 
+    parser = argparse.ArgumentParser(
+        description="Otimizador de portfólio (Monte Carlo vetorizado). Exemplo:\n"
+                     "  python portfolio_optimizer.py PETR4.SA VALE3.SA ITUB4.SA WEGE3.SA --min-weight 2 --max-weight 35",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("tickers", nargs="+", help="Tickers a incluir na simulação (ex: PETR4.SA VALE3.SA ...)")
+    parser.add_argument("--min-weight", type=float, default=0.0,
+                         help="Peso MÍNIMO por ativo, em %% (ex: 2 para 2%%). Padrão: 0 (sem mínimo).")
+    parser.add_argument("--max-weight", type=float, default=100.0,
+                         help="Peso MÁXIMO por ativo, em %% (ex: 35 para 35%%). Padrão: 100 (sem máximo).")
+    parser.add_argument("--n-portfolios", type=int, default=DEFAULT_N_PORTFOLIOS,
+                         help=f"Quantas carteiras aleatórias simular. Padrão: {DEFAULT_N_PORTFOLIOS:,}.")
+    parser.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS,
+                         help=f"Quantos dias de pregão usar no histórico. Padrão: {DEFAULT_LOOKBACK_DAYS} (~3 anos).")
+    parser.add_argument("--risk-free-rate", type=float, default=None,
+                         help="Taxa livre de risco anual, em %% (ex: 14.25). Se omitido, busca a Selic atual no Banco Central automaticamente.")
+    parser.add_argument("--capital", type=float, default=None,
+                         help="Se informado (em R$), mostra a alocação em quantidade de ações pra cada portfólio de destaque, "
+                              "usando o preço mais recente de cada ticker.")
+    parser.add_argument("--no-fractional-market", action="store_true",
+                         help="Usar só lotes padrão de 100 ações (em vez do mercado fracionário, que é o padrão) no cálculo de --capital.")
+    return parser.parse_args()
+
+
+def load_latest_prices(engine, tickers):
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT DISTINCT ON (ticker) ticker, adj_close
+            FROM prices_daily
+            WHERE ticker = ANY(:tickers) AND adj_close IS NOT NULL
+            ORDER BY ticker, date DESC
+        """), {"tickers": tickers}).fetchall()
+    return {r[0]: float(r[1]) for r in rows}
+
+
+def main():
+    args = parse_args()
     engine = create_engine(os.environ["DATABASE_URL"])
 
-    selic = fetch_selic_rate_anual()
-    print(f"Selic meta atual (Banco Central): {selic*100:.2f}% a.a. - usando como taxa livre de risco.")
+    if args.risk_free_rate is not None:
+        selic = args.risk_free_rate / 100
+        print(f"Taxa livre de risco informada manualmente: {selic*100:.2f}% a.a.")
+    else:
+        selic = fetch_selic_rate_anual()
+        print(f"Selic meta atual (Banco Central): {selic*100:.2f}% a.a. - usando como taxa livre de risco.")
 
-    ibov_ann_return_pct = compute_benchmark_ann_return_pct(engine)
+    ibov_ann_return_pct = compute_benchmark_ann_return_pct(engine, lookback_days=args.lookback_days)
     if ibov_ann_return_pct is not None:
         print(f"Ibovespa no mesmo período: {ibov_ann_return_pct:.2f}% a.a. (retorno anualizado, mesma janela/convenção dos portfólios abaixo).")
 
-    print(f"\nCarregando histórico de preços para {len(tickers)} tickers...")
-    returns = load_returns(engine, tickers)
+    min_weight = args.min_weight / 100
+    max_weight = args.max_weight / 100
+    if min_weight > 0 or max_weight < 1:
+        print(f"Restrição de peso por ativo: {args.min_weight:.1f}% a {args.max_weight:.1f}%")
+
+    print(f"\nCarregando histórico de preços para {len(args.tickers)} tickers...")
+    returns = load_returns(engine, args.tickers, lookback_days=args.lookback_days)
     print(f"  {returns.shape[0]} dias de pregão, {returns.shape[1]} tickers utilizáveis.")
 
-    print(f"Rodando {DEFAULT_N_PORTFOLIOS:,} simulações...")
-    results = run_simulation(returns, n_portfolios=DEFAULT_N_PORTFOLIOS, risk_free_rate_annual=selic)
+    print(f"Rodando {args.n_portfolios:,} simulações...")
+    results = run_simulation(returns, n_portfolios=args.n_portfolios, risk_free_rate_annual=selic,
+                              min_weight=min_weight, max_weight=max_weight)
 
-    best = find_optimal_portfolios(results, list(returns.columns))
+    tickers_usados = list(returns.columns)
+    best = find_optimal_portfolios(results, tickers_usados)
+
+    prices = load_latest_prices(engine, tickers_usados) if args.capital else None
+
     for name, info in best.items():
         print(f"\n=== {name} ===")
         if info is None:
@@ -381,6 +428,17 @@ def main():
         for ticker, w in weights_sorted:
             if w >= 0.5:
                 print(f"    {ticker}: {w}%")
+
+        if args.capital:
+            alocacao, sobra = discretize_allocation(
+                info["weights_pct"], prices, args.capital,
+                fractional_market=not args.no_fractional_market,
+            )
+            print(f"  --- alocação para R${args.capital:,.2f} ---")
+            for ticker, a in sorted(alocacao.items(), key=lambda x: -x[1]["valor_alocado"]):
+                if a["quantidade"] > 0:
+                    print(f"    {ticker}: {a['quantidade']} ações = R${a['valor_alocado']:,.2f} ({a['peso_realizado_pct']}%, alvo {a['peso_alvo_pct']}%)")
+            print(f"    caixa não alocado: R${sobra:,.2f}")
 
     chart_path = plot_efficient_frontier(results, best)
     print(f"\nGráfico salvo em: {chart_path}")
