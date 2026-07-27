@@ -1,0 +1,38 @@
+name: Daily Score Computation
+
+on:
+  workflow_run:
+    workflows: ["Daily Price Ingestion"]
+    types: [completed]
+  workflow_dispatch: {}
+
+jobs:
+  compute:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Market metrics
+        run: python compute_market_metrics.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      - name: Fundamental ratios + Piotroski
+        run: python compute_fundamental_ratios.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      - name: Altman Z + Beneish M + VTI
+        run: python compute_quality_scores.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      - name: Magic Formula + Gross Profitability + FCF Yield
+        run: python compute_magic_formula.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      - name: Composite score (peer groups)
+        run: python compute_composite_score.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
