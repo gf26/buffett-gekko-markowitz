@@ -49,6 +49,7 @@ SELECT
 
     fr.enterprise_value,
     fr.earnings_yield_pct,
+    fr.fcf_yield_pct,
     fr.return_on_capital_pct,
     fr.magic_formula_score,
     fr.magic_formula_rank,
