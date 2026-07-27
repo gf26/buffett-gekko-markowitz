@@ -106,10 +106,70 @@ def load_returns(engine, tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
     return returns
 
 
-def run_simulation(returns, n_portfolios=DEFAULT_N_PORTFOLIOS, risk_free_rate_annual=0.0, seed=None):
+def _validate_weight_bounds(n_assets, min_weight, max_weight):
+    if not (0 <= min_weight <= max_weight <= 1):
+        raise ValueError("É preciso que 0 <= min_weight <= max_weight <= 1.")
+    if min_weight * n_assets > 1.0 + 1e-9:
+        raise ValueError(
+            f"min_weight={min_weight:.1%} × {n_assets} ativos > 100% - impossível "
+            f"garantir esse mínimo para todos os ativos ao mesmo tempo. Reduza o "
+            f"mínimo ou inclua mais ativos."
+        )
+    if max_weight * n_assets < 1.0 - 1e-9:
+        raise ValueError(
+            f"max_weight={max_weight:.1%} × {n_assets} ativos < 100% - impossível "
+            f"chegar a 100% respeitando esse teto. Aumente o máximo ou inclua mais ativos."
+        )
+
+
+def _sample_constrained_weights(n_assets, n_portfolios, min_weight, max_weight, rng, max_attempts_multiplier=200):
+    """Gera pesos aleatórios somando 1, respeitando min_weight <= peso <= max_weight
+    por ativo, via amostragem por rejeição (mantém a amostra estatisticamente
+    correta - uniforme sobre a região viável - em vez de uma fórmula customizada
+    que poderia enviesar os resultados sem se perceber)."""
+    if min_weight <= 0.0 and max_weight >= 1.0:
+        return rng.dirichlet(np.ones(n_assets), size=n_portfolios)
+
+    _validate_weight_bounds(n_assets, min_weight, max_weight)
+
+    accepted_batches = []
+    n_accepted = 0
+    total_generated = 0
+    batch_size = max(n_portfolios, 5000)
+    max_total = n_portfolios * max_attempts_multiplier
+
+    while n_accepted < n_portfolios and total_generated < max_total:
+        batch = rng.dirichlet(np.ones(n_assets), size=batch_size)
+        mask = np.all((batch >= min_weight) & (batch <= max_weight), axis=1)
+        valid = batch[mask]
+        accepted_batches.append(valid)
+        n_accepted += len(valid)
+        total_generated += batch_size
+
+    W = np.vstack(accepted_batches) if accepted_batches else np.empty((0, n_assets))
+    acceptance_rate = len(W) / total_generated if total_generated else 0
+    print(f"  restrição de peso: {acceptance_rate:.1%} dos portfólios gerados respeitavam os limites "
+          f"({len(W):,} válidos de {total_generated:,} tentados)")
+
+    if len(W) < n_portfolios:
+        print(f"  aviso: só consegui {len(W):,} portfólios válidos (pedi {n_portfolios:,}) - limites "
+              f"muito apertados para {n_assets} ativos. Considere afrouxar min/max_weight.")
+        return W
+    return W[:n_portfolios]
+
+
+def run_simulation(returns, n_portfolios=DEFAULT_N_PORTFOLIOS, risk_free_rate_annual=0.0,
+                    min_weight=0.0, max_weight=1.0, seed=None):
     """Roda a simulação de Monte Carlo vetorizada. Retorna um DataFrame com
     uma linha por portfólio simulado: retorno/vol/Sharpe/Sortino anualizados
-    + o peso de cada ticker."""
+    + o peso de cada ticker.
+
+    min_weight/max_weight (0 a 1, ex: 0.02 e 0.35 para 2%-35%) restringem a
+    alocação por ativo - nenhum portfólio simulado terá um ativo fora dessa
+    faixa. Isso pode "esconder" a carteira numericamente ótima sem restrição,
+    de propósito: o objetivo é evitar posições irrelevantes ou concentração
+    excessiva num único ativo, não necessariamente maximizar Sharpe a
+    qualquer custo."""
     rng = np.random.default_rng(seed)
     tickers = list(returns.columns)
     n_assets = len(tickers)
@@ -117,8 +177,9 @@ def run_simulation(returns, n_portfolios=DEFAULT_N_PORTFOLIOS, risk_free_rate_an
     mean_daily = returns.mean().to_numpy()
     cov_daily = returns.cov().to_numpy()
 
-    # pesos aleatórios somando 1, uniformemente distribuídos no simplex
-    W = rng.dirichlet(np.ones(n_assets), size=n_portfolios)  # (n_portfolios, n_assets)
+    W = _sample_constrained_weights(n_assets, n_portfolios, min_weight, max_weight, rng)
+    if len(W) == 0:
+        raise ValueError("Nenhum portfólio válido gerado dentro dos limites de peso - afrouxe as restrições.")
 
     ann_return = (W @ mean_daily) * TRADING_DAYS_PER_YEAR
 
@@ -141,6 +202,58 @@ def run_simulation(returns, n_portfolios=DEFAULT_N_PORTFOLIOS, risk_free_rate_an
     })
     weights = pd.DataFrame(W * 100, columns=[f"peso_{t}" for t in tickers])
     return pd.concat([results, weights], axis=1)
+
+
+def discretize_allocation(weights_pct, prices, capital, fractional_market=True):
+    """
+    Converte pesos-alvo (%) numa alocação real, em quantidade de ações -
+    porque não dá pra comprar uma fração arbitrária de ação, então o peso
+    exato quase nunca é atingível.
+
+    weights_pct: dict {ticker: peso percentual, ex: 12.34}
+    prices: dict {ticker: preço atual}
+    capital: valor total em R$ a alocar
+    fractional_market: se True (padrão), permite comprar de 1 em 1 ação -
+        o "mercado fracionário" da B3 (tickers com sufixo F, ex: PETR4F).
+        Se False, só permite lotes fechados de 100 ações (lote padrão) -
+        nesse modo, posições pequenas em ações caras podem ficar com
+        quantidade 0 (não dá pra comprar 1 lote inteiro dentro do orçamento
+        daquele ativo).
+
+    Arredonda sempre PARA BAIXO (nunca ultrapassa o capital disponível) - uma
+    corretora não deixaria você comprar além do que você tem em conta, então
+    "sobra de caixa" negativa não faria sentido aqui.
+
+    Retorna (alocacao, caixa_sobrando):
+        alocacao: dict {ticker: {peso_alvo_pct, quantidade, valor_alocado, peso_realizado_pct}}
+        caixa_sobrando: R$ não alocado (sempre >= 0), porque quantidades inteiras
+            raramente usam 100% do capital exatamente
+    """
+    step = 1 if fractional_market else 100
+    alocacao = {}
+    total_alocado = 0.0
+
+    for ticker, w in weights_pct.items():
+        if ticker not in prices or prices[ticker] is None or prices[ticker] <= 0:
+            raise ValueError(f"Preço ausente ou inválido para {ticker}.")
+        valor_alvo = capital * w / 100
+        preco = prices[ticker]
+        qtd_bruta = valor_alvo / preco
+        qtd_passos = int(qtd_bruta // step)  # sempre para baixo
+        quantidade = qtd_passos * step
+        valor_alocado = quantidade * preco
+        alocacao[ticker] = {
+            "peso_alvo_pct": round(w, 2),
+            "quantidade": quantidade,
+            "valor_alocado": round(valor_alocado, 2),
+        }
+        total_alocado += valor_alocado
+
+    caixa_sobrando = round(capital - total_alocado, 2)
+    for ticker in alocacao:
+        alocacao[ticker]["peso_realizado_pct"] = round(alocacao[ticker]["valor_alocado"] / capital * 100, 2)
+
+    return alocacao, caixa_sobrando
 
 
 def load_single_ticker_returns(engine, ticker, lookback_days=DEFAULT_LOOKBACK_DAYS):
