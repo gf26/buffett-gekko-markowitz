@@ -294,6 +294,7 @@ def find_optimal_portfolios(results, tickers):
             continue
         row = results.loc[i]
         out[name] = {
+            "index": i,
             "ann_return_pct": round(float(row["ann_return_pct"]), 2),
             "ann_vol_pct": round(float(row["ann_vol_pct"]), 2),
             "sharpe": round(float(row["sharpe"]), 3),
@@ -303,38 +304,139 @@ def find_optimal_portfolios(results, tickers):
     return out
 
 
-def plot_efficient_frontier(results, best, output_path="efficient_frontier.png"):
-    """Gera o gráfico clássico de fronteira eficiente: cada ponto é um
-    portfólio simulado (cor = Sharpe), com os 4 portfólios de destaque
-    marcados. Salva em output_path."""
+def compute_pareto_frontier(results):
+    """Retorna só os portfólios NÃO-DOMINADOS: nenhum outro portfólio
+    simulado tem retorno >= e volatilidade <= ao mesmo tempo. Isso é a
+    "curva ótima" de verdade - o resto da nuvem é sempre pior que algum
+    ponto da fronteira em pelo menos uma dimensão."""
+    ordered = results.sort_values("ann_vol_pct")
+    returns = ordered["ann_return_pct"].to_numpy()
+    keep = np.empty(len(ordered), dtype=bool)
+    best_so_far = -np.inf
+    for i in range(len(ordered)):
+        if returns[i] > best_so_far:
+            keep[i] = True
+            best_so_far = returns[i]
+        else:
+            keep[i] = False
+    return ordered[keep]
+
+
+def select_intermediate_portfolios(frontier, exclude_indices, tickers, n=10):
+    """Escolhe até `n` portfólios da fronteira eficiente, distribuídos
+    uniformemente por volatilidade, excluindo os que já são campeões (pra
+    não repetir o que já vai aparecer destacado)."""
+    candidates = frontier.drop(index=[i for i in exclude_indices if i in frontier.index], errors="ignore")
+    if candidates.empty:
+        return []
+    n = min(n, len(candidates))
+    positions = np.linspace(0, len(candidates) - 1, n).round().astype(int)
+    positions = sorted(set(positions))  # remove duplicatas se n > pontos distintos
+    picked = candidates.iloc[positions]
+
+    out = []
+    for i, row in picked.iterrows():
+        out.append({
+            "index": i,
+            "ann_return_pct": round(float(row["ann_return_pct"]), 2),
+            "ann_vol_pct": round(float(row["ann_vol_pct"]), 2),
+            "sharpe": round(float(row["sharpe"]), 3),
+            "sortino": round(float(row["sortino"]), 3) if pd.notna(row["sortino"]) else None,
+            "weights_pct": {t: round(float(row[f"peso_{t}"]), 2) for t in tickers},
+        })
+    return out
+
+
+def plot_efficient_frontier(results, best, risk_free_rate_annual, intermediate=None, output_path="efficient_frontier.png"):
+    """Gráfico da fronteira eficiente, com foco visual só no que interessa:
+    - nuvem de fundo (dominados ou abaixo da taxa livre de risco): apagada,
+      só para dar contexto de onde vieram as simulações.
+    - fronteira eficiente (não-dominados, acima da taxa livre de risco):
+      linha contínua destacada - a "curva ótima" de verdade.
+    - até 10 pontos intermediários da fronteira: marcadores numerados, para
+      escolher um meio-termo entre os campeões.
+    - os 4 campeões (maior retorno, menor vol, maior Sharpe, maior Sortino):
+      estrelas grandes, com rótulo. Quando dois campeões coincidem no MESMO
+      portfólio simulado, viram uma estrela só com os dois nomes juntos, em
+      vez de dois marcadores sobrepostos e ilegíveis.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(10, 7))
-    scatter = ax.scatter(
-        results["ann_vol_pct"], results["ann_return_pct"],
-        c=results["sharpe"], cmap="viridis", s=4, alpha=0.5,
-    )
-    plt.colorbar(scatter, label="Sharpe")
+    plt.rcParams.update({
+        "font.size": 11,
+        "axes.edgecolor": "#444444",
+        "axes.labelcolor": "#222222",
+        "text.color": "#222222",
+        "axes.titleweight": "bold",
+    })
 
-    markers = {
-        "maior_retorno": ("*", "red", "Maior retorno"),
-        "menor_volatilidade": ("*", "blue", "Menor volatilidade"),
-        "maior_sharpe": ("*", "gold", "Maior Sharpe"),
-        "maior_sortino": ("*", "magenta", "Maior Sortino"),
+    rf_pct = risk_free_rate_annual * 100
+    focus_mask = results["ann_return_pct"] > rf_pct
+    frontier = compute_pareto_frontier(results)
+    frontier_focus = frontier[frontier["ann_return_pct"] > rf_pct]
+
+    fig, ax = plt.subplots(figsize=(11, 7.5))
+    ax.set_facecolor("#fbfbfb")
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    ax.grid(True, color="#e3e3e3", linewidth=0.8, zorder=0)
+
+    # nuvem de fundo, apagada: tudo que não está em foco (dominado, ou abaixo da taxa livre de risco)
+    background = results[~results.index.isin(frontier_focus.index)]
+    ax.scatter(background["ann_vol_pct"], background["ann_return_pct"],
+               s=5, alpha=0.12, color="#9aa5b1", linewidths=0, zorder=1, label=None)
+
+    # linha de referência: taxa livre de risco
+    ax.axhline(rf_pct, color="#c2c2c2", linestyle="--", linewidth=1, zorder=1)
+    ax.text(results["ann_vol_pct"].max(), rf_pct, f"  Selic ({rf_pct:.2f}%)",
+            color="#888888", fontsize=9, va="center")
+
+    # fronteira eficiente em foco: linha + pontos
+    ax.plot(frontier_focus["ann_vol_pct"], frontier_focus["ann_return_pct"],
+            color="#2f6fb3", linewidth=2, zorder=2, label="Fronteira eficiente")
+    ax.scatter(frontier_focus["ann_vol_pct"], frontier_focus["ann_return_pct"],
+               s=10, color="#2f6fb3", alpha=0.6, zorder=2)
+
+    # pontos intermediários: numerados
+    if intermediate:
+        for n, p in enumerate(intermediate, start=1):
+            ax.scatter(p["ann_vol_pct"], p["ann_return_pct"], marker="o", s=90,
+                       facecolor="white", edgecolor="#2f6fb3", linewidth=1.6, zorder=4)
+            ax.annotate(str(n), (p["ann_vol_pct"], p["ann_return_pct"]),
+                        ha="center", va="center", fontsize=8, fontweight="bold", color="#2f6fb3", zorder=5)
+
+    # campeões, agrupando quem coincide no mesmo portfólio simulado
+    champion_style = {
+        "maior_retorno": ("Maior retorno", "#d62728"),
+        "menor_volatilidade": ("Menor volatilidade", "#1f9e5c"),
+        "maior_sharpe": ("Maior Sharpe", "#e0a400"),
+        "maior_sortino": ("Maior Sortino", "#9b4fd1"),
     }
-    for key, (marker, color, label) in markers.items():
-        info = best.get(key)
+    grouped = {}
+    for key, info in best.items():
         if info is None:
             continue
-        ax.scatter(info["ann_vol_pct"], info["ann_return_pct"], marker=marker,
-                   color=color, s=400, edgecolor="black", linewidth=1, label=label, zorder=5)
+        grouped.setdefault(info["index"], []).append(key)
+
+    text_offsets = [(12, 12), (12, -18), (-70, 12), (-70, -18)]
+    for offset_i, (idx, keys) in enumerate(grouped.items()):
+        info = best[keys[0]]
+        labels = [champion_style[k][0] for k in keys]
+        color = champion_style[keys[0]][1] if len(keys) == 1 else "#c2185b"
+        combined_label = " & ".join(labels)
+        ax.scatter(info["ann_vol_pct"], info["ann_return_pct"], marker="*", s=550,
+                   color=color, edgecolor="black", linewidth=1, zorder=6)
+        dx, dy = text_offsets[offset_i % len(text_offsets)]
+        ax.annotate(combined_label, (info["ann_vol_pct"], info["ann_return_pct"]),
+                    xytext=(dx, dy), textcoords="offset points", fontsize=9, fontweight="bold",
+                    color=color, arrowprops=dict(arrowstyle="-", color=color, linewidth=0.8))
 
     ax.set_xlabel("Volatilidade anualizada (%)")
     ax.set_ylabel("Retorno anualizado (%)")
-    ax.set_title("Fronteira Eficiente - Simulação de Monte Carlo")
-    ax.legend()
+    ax.set_title("Fronteira Eficiente", loc="left", fontsize=14)
+    ax.legend(loc="lower right", frameon=False)
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
@@ -409,9 +511,16 @@ def main():
 
     tickers_usados = list(returns.columns)
     best = find_optimal_portfolios(results, tickers_usados)
+    champion_indices = [info["index"] for info in best.values() if info is not None]
+
+    frontier = compute_pareto_frontier(results)
+    intermediate = select_intermediate_portfolios(frontier, champion_indices, tickers_usados, n=10)
 
     prices = load_latest_prices(engine, tickers_usados) if args.capital else None
 
+    print("\n" + "=" * 60)
+    print("PORTFÓLIOS DE DESTAQUE")
+    print("=" * 60)
     for name, info in best.items():
         print(f"\n=== {name} ===")
         if info is None:
@@ -440,7 +549,17 @@ def main():
                     print(f"    {ticker}: {a['quantidade']} ações = R${a['valor_alocado']:,.2f} ({a['peso_realizado_pct']}%, alvo {a['peso_alvo_pct']}%)")
             print(f"    caixa não alocado: R${sobra:,.2f}")
 
-    chart_path = plot_efficient_frontier(results, best)
+    if intermediate:
+        print("\n" + "=" * 60)
+        print(f"PONTOS INTERMEDIÁRIOS NA FRONTEIRA ({len(intermediate)}) - trade-offs entre os campeões")
+        print("=" * 60)
+        for n, p in enumerate(intermediate, start=1):
+            print(f"\n--- #{n} --- retorno: {p['ann_return_pct']}% | vol: {p['ann_vol_pct']}% | Sharpe: {p['sharpe']}")
+            weights_sorted = sorted(p["weights_pct"].items(), key=lambda x: -x[1])
+            top_holdings = ", ".join(f"{t} {w}%" for t, w in weights_sorted if w >= 1)
+            print(f"    {top_holdings}")
+
+    chart_path = plot_efficient_frontier(results, best, selic, intermediate=intermediate)
     print(f"\nGráfico salvo em: {chart_path}")
 
 
