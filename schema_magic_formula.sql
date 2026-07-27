@@ -9,3 +9,6 @@ ALTER TABLE fundamental_ratios ADD COLUMN IF NOT EXISTS magic_formula_rank      
 
 ALTER TABLE fundamental_ratios ADD COLUMN IF NOT EXISTS gross_profitability_pct     NUMERIC;  -- Lucro Bruto / Ativos Totais
 ALTER TABLE fundamental_ratios ADD COLUMN IF NOT EXISTS gross_profitability_rank    INTEGER;  -- posição, 1 = melhor
+
+-- Adição: FCF Yield, segundo índice de "barateza" (visão de caixa, em vez de contábil).
+ALTER TABLE fundamental_ratios ADD COLUMN IF NOT EXISTS fcf_yield_pct NUMERIC;
