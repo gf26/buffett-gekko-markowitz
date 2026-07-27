@@ -115,6 +115,20 @@ def _annualized_mu_sigma(returns):
     return mu, S
 
 
+def _shrink_mu(mu, shrinkage):
+    """Encolhe o retorno esperado de cada ativo em direção à média do grupo
+    (James-Stein-style). shrinkage=0 não muda nada; shrinkage=1 faz todo
+    ativo usar a mesma média (elimina toda a disparidade entre ativos).
+    Ataca a CAUSA da concentração excessiva (estimativas de retorno
+    extremas/ruidosas), diferente da regularização L2 (que ataca o SINTOMA,
+    penalizando concentração no peso em si sem mudar a estimativa que a
+    motiva)."""
+    if shrinkage <= 0:
+        return mu
+    grand_mean = mu.mean()
+    return mu * (1 - shrinkage) + grand_mean * shrinkage
+
+
 def _portfolio_downside_dev_annual(weights, returns):
     """Semi-desvio anualizado do retorno histórico do portfólio para um dict
     de pesos {ticker: peso decimal}."""
@@ -142,7 +156,7 @@ def _solve_max_return(mu, min_weight, max_weight):
 
 
 def solve_frontier(returns, risk_free_rate_annual=0.0, min_weight=0.0, max_weight=1.0,
-                    n_frontier_points=DEFAULT_N_FRONTIER_POINTS, l2_gamma=0.0):
+                    n_frontier_points=DEFAULT_N_FRONTIER_POINTS, l2_gamma=0.0, mu_shrinkage=0.0):
     """
     Resolve a fronteira eficiente EXATA via otimização convexa (PyPortfolioOpt/
     Markowitz) - em vez de simular portfólios aleatórios, resolve diretamente
@@ -159,16 +173,31 @@ def solve_frontier(returns, risk_free_rate_annual=0.0, min_weight=0.0, max_weigh
 
     l2_gamma > 0 adiciona regularização L2 (objective_functions.L2_reg) -
     penaliza concentração de peso, o que tende a produzir carteiras mais
-    diversificadas e menos "grudadas" nos limites min/max_weight. É uma
-    resposta padrão ao fato de que a otimização média-variância é sensível
-    a erro de estimativa nos retornos esperados e tende a soluções de canto.
-    Não se aplica ao portfólio de maior retorno (esse é uma solução de canto
-    por definição - maximizar retorno sob limites de peso não tem "meio
-    termo" a regularizar).
+    diversificadas e menos "grudadas" nos limites min/max_weight. Ataca o
+    SINTOMA (concentração no peso). Não se aplica ao portfólio de maior
+    retorno (esse é uma solução de canto por definição).
+
+    mu_shrinkage (0 a 1) encolhe o retorno esperado de cada ativo em direção
+    à média do grupo antes de otimizar - ataca a CAUSA mais comum da
+    concentração excessiva (estimativas de retorno muito ruidosas/extremas
+    para 1-2 ativos, dominando a otimização). Se um ou dois ativos tiverem
+    tido retorno destoante do resto no período analisado, tente isso antes
+    de aumentar l2_gamma - é mais provável resolver o problema pela raiz.
     """
     tickers = list(returns.columns)
     mu, S = _annualized_mu_sigma(returns)
+    if mu_shrinkage > 0:
+        mu = _shrink_mu(mu, mu_shrinkage)
     bounds = (min_weight, max_weight)
+
+    mu_sorted = mu.sort_values(ascending=False)
+    print("  retorno anualizado esperado por ativo (usado na otimização):")
+    for t, m in mu_sorted.items():
+        print(f"    {t}: {m*100:.1f}%")
+    spread = mu_sorted.iloc[0] - mu_sorted.iloc[-1]
+    if spread > 0.50:
+        print(f"  aviso: diferença de {spread*100:.0f} p.p. entre o maior e o menor retorno esperado - "
+              f"disparidade grande, a otimização deve concentrar pesado no(s) topo(s) independente de regularização moderada.")
 
     def new_ef():
         ef = EfficientFrontier(mu, S, weight_bounds=bounds)
@@ -611,6 +640,11 @@ def parse_args():
     parser.add_argument("--l2-gamma", type=float, default=0.0,
                          help="Regularização L2 (0 = desligada). Valores tipo 0.1-1 tendem a espalhar mais "
                               "os pesos, reduzindo carteiras 'grudadas' nos limites min/max-weight.")
+    parser.add_argument("--mu-shrinkage", type=float, default=0.0,
+                         help="Encolhimento do retorno esperado em direção à média do grupo, de 0 (nenhum) "
+                              "a 1 (todo ativo usa a mesma média). Ataca a causa mais comum de concentração "
+                              "excessiva - 1 ou 2 ativos com retorno histórico destoante dominando a otimização. "
+                              "Tente isso antes de aumentar --l2-gamma.")
     parser.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS,
                          help=f"Quantos dias de pregão usar no histórico. Padrão: {DEFAULT_LOOKBACK_DAYS} (~3 anos).")
     parser.add_argument("--risk-free-rate", type=float, default=None,
@@ -659,10 +693,13 @@ def main():
     print(f"  {returns.shape[0]} dias de pregão, {returns.shape[1]} tickers utilizáveis.")
 
     print(f"\nResolvendo a fronteira eficiente ({args.n_frontier_points} pontos, via otimização convexa)...")
+    if args.mu_shrinkage > 0:
+        print(f"  encolhimento de retorno esperado ativado ({args.mu_shrinkage:.0%} em direção à média do grupo).")
     if args.l2_gamma > 0:
         print(f"  regularização L2 ativada (gamma={args.l2_gamma}) - deve reduzir concentração nos limites de peso.")
     frontier = solve_frontier(returns, risk_free_rate_annual=selic, min_weight=min_weight, max_weight=max_weight,
-                               n_frontier_points=args.n_frontier_points, l2_gamma=args.l2_gamma)
+                               n_frontier_points=args.n_frontier_points, l2_gamma=args.l2_gamma,
+                               mu_shrinkage=args.mu_shrinkage)
 
     tickers_usados = list(returns.columns)
     best = find_optimal_portfolios(frontier, tickers_usados)
