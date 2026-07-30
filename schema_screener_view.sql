@@ -41,6 +41,7 @@ SELECT
     mm.sharpe_ratio,
     mm.sortino_ratio,
     mm.max_drawdown_pct,
+    mm.avg_daily_value_brl,
 
     fr.fiscal_date_lfy,
     fr.data_sources,
