@@ -57,6 +57,10 @@ def upsert_financials(cur, df, ticker, statement, period_type):
         return 0
     rows = [(ticker, statement, period_type, r.fiscal_date, r.line_item, float(r.value))
             for r in long_df.itertuples(index=False)]
+    # first_seen_at NÃO é atualizado no conflito de propósito: ele registra
+    # quando vimos aquele dado pela PRIMEIRA vez, servindo de proxy para
+    # disponibilidade da informação (o Yahoo não informa a data de publicação
+    # do balanço). O fetched_at, esse sim, marca a última coleta.
     execute_values(cur, """
         INSERT INTO financials (ticker, statement, period_type, fiscal_date, line_item, value)
         VALUES %s
