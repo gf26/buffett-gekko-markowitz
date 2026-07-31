@@ -1,0 +1,84 @@
+-- Camada 1: liquidez, rastreamento point-in-time e deslistagem.
+-- Rode uma vez no SQL Editor do Supabase.
+
+-- ============================================================
+-- 1. LIQUIDEZ
+-- ============================================================
+-- Volume financeiro médio diário (ADTV - Average Daily Traded Value), em R$.
+-- Calculado por compute_market_metrics.py a partir de close * volume.
+-- Serve para saber se uma posição é executável no mundo real: de nada adianta
+-- o otimizador sugerir R$ 30 mil num papel que gira R$ 80 mil por dia.
+ALTER TABLE market_metrics ADD COLUMN IF NOT EXISTS avg_daily_value_brl NUMERIC;
+ALTER TABLE market_metrics ADD COLUMN IF NOT EXISTS liquidity_days       INTEGER;  -- quantos pregões entraram na média
+
+-- ============================================================
+-- 2. POINT-IN-TIME (viés de antecipação)
+-- ============================================================
+-- O Yahoo Finance NÃO informa a data de publicação dos demonstrativos - só a
+-- data do exercício (fiscal_date). Isso impede backtest honesto, porque usar
+-- o balanço de 31/12 como se estivesse disponível em 31/12 é look-ahead bias
+-- (na prática ele só sai ~3 meses depois).
+--
+-- Duas mitigações, ambas implementadas:
+--   (a) first_seen_at: quando NÓS vimos aquele dado pela primeira vez. Só é
+--       gravado no INSERT, nunca sobrescrito no UPDATE - diferente de
+--       fetched_at, que é atualizado toda semana. É um proxy REAL de
+--       disponibilidade, mas só vale daqui pra frente (dados já coletados
+--       terão first_seen_at = agora, não a data real de publicação).
+--   (b) Um lag conservador de N meses aplicado sobre fiscal_date em qualquer
+--       análise histórica - ver pit_helpers.py. Não é perfeito, mas é honesto
+--       e funciona retroativamente.
+ALTER TABLE financials ADD COLUMN IF NOT EXISTS first_seen_at  TIMESTAMPTZ DEFAULT now();
+ALTER TABLE financials ADD COLUMN IF NOT EXISTS published_date DATE;  -- reservado: preenchível se um dia migrarmos para uma fonte que informe isso
+
+-- ============================================================
+-- 3. VIÉS DE SOBREVIVÊNCIA
+-- ============================================================
+-- A coluna 'active' já existe, mas não guarda QUANDO o ticker saiu. Sem isso,
+-- não dá para montar o universo histórico correto ("quais empresas existiam em
+-- jan/2023?") - e qualquer backtest fica otimista, porque só considera quem
+-- sobreviveu até hoje.
+ALTER TABLE tickers ADD COLUMN IF NOT EXISTS delisted_date DATE;
+ALTER TABLE tickers ADD COLUMN IF NOT EXISTS delisting_note TEXT;  -- ex: 'incorporada por X', 'falência', 'OPA'
+
+-- Preenchimento é manual/semiautomático: o Yahoo não avisa deslistagem de forma
+-- estruturada. Esta view levanta os candidatos para você revisar e marcar:
+CREATE OR REPLACE VIEW vw_candidatos_deslistagem AS
+SELECT
+    t.ticker,
+    t.name,
+    t.active,
+    t.delisted_date,
+    MAX(p.date)                            AS ultimo_pregao,
+    CURRENT_DATE - MAX(p.date)             AS dias_sem_negociar
+FROM tickers t
+JOIN prices_daily p ON p.ticker = t.ticker
+GROUP BY t.ticker, t.name, t.active, t.delisted_date
+HAVING MAX(p.date) < CURRENT_DATE - INTERVAL '30 days'
+ORDER BY MAX(p.date);
+
+-- Depois de conferir, marque cada um assim (exemplo):
+--   UPDATE tickers SET active = FALSE, delisted_date = '2023-05-10',
+--          delisting_note = 'incorporada'
+--   WHERE ticker = 'XXXX3.SA';
+
+-- ============================================================
+-- 4. VIEW DE LIQUIDEZ (navegação)
+-- ============================================================
+CREATE OR REPLACE VIEW vw_liquidez AS
+SELECT
+    t.ticker,
+    t.name,
+    mm.avg_daily_value_brl,
+    mm.liquidity_days,
+    CASE
+        WHEN mm.avg_daily_value_brl IS NULL       THEN 'sem dado'
+        WHEN mm.avg_daily_value_brl <   100000    THEN 'muito baixa (< R$ 100 mil/dia)'
+        WHEN mm.avg_daily_value_brl <  1000000    THEN 'baixa (R$ 100 mil - 1 mi/dia)'
+        WHEN mm.avg_daily_value_brl <  5000000    THEN 'média (R$ 1 - 5 mi/dia)'
+        ELSE                                            'alta (> R$ 5 mi/dia)'
+    END AS faixa_liquidez
+FROM tickers t
+LEFT JOIN market_metrics mm ON mm.ticker = t.ticker
+WHERE t.active = TRUE
+ORDER BY mm.avg_daily_value_brl DESC NULLS LAST;
