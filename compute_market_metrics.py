@@ -26,6 +26,7 @@ LOOKBACK_DAYS = 252 * 3       # ~3 years of trading days
 TRADING_DAYS_PER_YEAR = 252
 RISK_FREE_RATE_ANNUAL = 0.0   # simplification - see note above
 MIN_OBSERVATIONS = 60         # skip tickers with too little history to be meaningful
+LIQUIDITY_LOOKBACK_DAYS = 60  # janela para o volume financeiro médio diário (ADTV)
 
 
 def get_active_tickers():
@@ -35,16 +36,30 @@ def get_active_tickers():
 
 
 def load_prices(ticker):
+    """Carrega adj_close (para retorno/risco) e close*volume (para liquidez).
+    Liquidez usa o preço NÃO ajustado de propósito: o objetivo é estimar quanto
+    dinheiro de verdade trocou de mãos no pregão, não o retorno ajustado."""
     with engine.connect() as conn:
         df = pd.read_sql(
             text("""
-                SELECT date, adj_close FROM prices_daily
+                SELECT date, adj_close, close, volume FROM prices_daily
                 WHERE ticker = :t AND adj_close IS NOT NULL
                 ORDER BY date DESC LIMIT :n
             """),
             conn, params={"t": ticker, "n": LOOKBACK_DAYS},
         )
     return df.sort_values("date").reset_index(drop=True)
+
+
+def compute_liquidity(df):
+    """Volume financeiro médio diário (ADTV) em R$, sobre os últimos
+    LIQUIDITY_LOOKBACK_DAYS pregões disponíveis."""
+    recent = df.tail(LIQUIDITY_LOOKBACK_DAYS)
+    valid = recent.dropna(subset=["close", "volume"])
+    if valid.empty:
+        return None, 0
+    traded_value = (valid["close"].astype(float) * valid["volume"].astype(float))
+    return float(round(traded_value.mean(), 2)), int(len(valid))
 
 
 def compute_metrics(df):
@@ -96,7 +111,8 @@ def upsert_metrics(rows):
             execute_values(cur, """
                 INSERT INTO market_metrics (
                     ticker, obs_start, obs_end, trading_days, total_return_pct,
-                    cagr_pct, ann_volatility_pct, sharpe_ratio, sortino_ratio, max_drawdown_pct
+                    cagr_pct, ann_volatility_pct, sharpe_ratio, sortino_ratio, max_drawdown_pct,
+                    avg_daily_value_brl, liquidity_days
                 ) VALUES %s
                 ON CONFLICT (ticker) DO UPDATE SET
                     calculated_at = now(),
@@ -108,7 +124,9 @@ def upsert_metrics(rows):
                     ann_volatility_pct = EXCLUDED.ann_volatility_pct,
                     sharpe_ratio = EXCLUDED.sharpe_ratio,
                     sortino_ratio = EXCLUDED.sortino_ratio,
-                    max_drawdown_pct = EXCLUDED.max_drawdown_pct
+                    max_drawdown_pct = EXCLUDED.max_drawdown_pct,
+                    avg_daily_value_brl = EXCLUDED.avg_daily_value_brl,
+                    liquidity_days = EXCLUDED.liquidity_days
             """, rows, page_size=500)
         conn.commit()
     finally:
@@ -127,15 +145,27 @@ def main():
         if m is None:
             skipped += 1
             continue
+        adtv, liq_days = compute_liquidity(df)
         rows.append((
             t, m["obs_start"], m["obs_end"], m["trading_days"], m["total_return_pct"],
             m["cagr_pct"], m["ann_volatility_pct"], m["sharpe_ratio"], m["sortino_ratio"], m["max_drawdown_pct"],
+            adtv, liq_days,
         ))
         if i % 50 == 0:
             print(f"  ...{i}/{len(tickers)} processados")
 
     upsert_metrics(rows)
     print(f"Done. {len(rows)} tickers com métricas calculadas, {skipped} pulados (histórico insuficiente).")
+
+    liquid = [r for r in rows if r[10] is not None]
+    if liquid:
+        adtvs = sorted(r[10] for r in liquid)
+        median = adtvs[len(adtvs) // 2]
+        print(f"\nLiquidez (volume financeiro médio diário, {LIQUIDITY_LOOKBACK_DAYS} pregões):")
+        print(f"  mediana do universo: R$ {median:,.0f}")
+        for floor in (100_000, 500_000, 1_000_000, 5_000_000):
+            n = sum(1 for a in adtvs if a >= floor)
+            print(f"  tickers acima de R$ {floor:,}: {n} de {len(adtvs)}")
 
 
 if __name__ == "__main__":
