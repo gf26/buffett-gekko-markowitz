@@ -173,7 +173,7 @@ def run_backtest(engine, args):
         raise SystemExit("Sem dados suficientes no banco. Rode os scripts de ingestão primeiro.")
 
     first_available = all_fin["available_from"].min()
-    start = max(pd.Timestamp(first_available), prices_adj.index.min() + pd.Timedelta(days=365))
+    start = max(pd.Timestamp(first_available), pd.Timestamp(prices_adj.index.min()) + pd.Timedelta(days=365))
     end = prices_adj.index.max()
     dates = [d for d in rebalance_dates(start, end, frequency=args.rebalance_freq)]
     dates = [nearest_trading_day(prices_adj.index, d) for d in dates]
@@ -193,13 +193,15 @@ def run_backtest(engine, args):
     for i, rebal_date in enumerate(dates[:-1]):
         next_date = dates[i + 1]
         window = prices_adj.loc[prices_adj.index <= rebal_date]
-        returns_window = np.log(window / window.shift(1)).dropna(how="all").tail(args.lookback_days)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            returns_window = np.log(window / window.shift(1)).dropna(how="all").tail(args.lookback_days)
 
         # só tickers com histórico suficiente ATÉ esta data (não até hoje)
         enough = returns_window.columns[returns_window.notna().sum() >= args.min_history_days]
 
         metrics = scoring.build_metrics_snapshot(all_fin, rebal_date, prices_adj, shares, sectors)
         if metrics.empty:
+            print(f"  {rebal_date.date()}: nenhum fundamento disponível nesta data - pulando")
             continue
         scored = scoring.compute_composite(metrics)
         scored = scored[scored.index.isin(enough)]
