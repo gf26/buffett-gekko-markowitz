@@ -40,7 +40,7 @@ import pandas as pd
 import requests
 from scipy.optimize import linprog
 from sqlalchemy import create_engine, text
-from pypfopt import EfficientFrontier, objective_functions
+from pypfopt import EfficientFrontier, objective_functions, risk_models
 from pypfopt.exceptions import OptimizationError
 
 TRADING_DAYS_PER_YEAR = 252
@@ -106,12 +106,81 @@ def load_returns(engine, tickers, lookback_days=DEFAULT_LOOKBACK_DAYS):
     return returns
 
 
-def _annualized_mu_sigma(returns):
+def load_liquidity(engine, tickers):
+    """Volume financeiro médio diário (R$) por ticker, de market_metrics."""
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT ticker, avg_daily_value_brl FROM market_metrics
+            WHERE ticker = ANY(:tickers)
+        """), {"tickers": tickers}).fetchall()
+    return {r[0]: (float(r[1]) if r[1] is not None else None) for r in rows}
+
+
+def apply_liquidity_filter(engine, returns, min_adtv_brl, exclude=False):
+    """
+    Avisa sobre (e opcionalmente remove) tickers com liquidez abaixo do piso.
+
+    Por padrão apenas AVISA (exclude=False), seguindo o mesmo princípio já
+    adotado no screener: sinalizar sem esconder. Passe exclude=True para
+    remover de fato da otimização.
+
+    Liquidez importa porque uma carteira "ótima" que exija R$ 30 mil num papel
+    que gira R$ 80 mil por dia é inexecutável - você move o preço contra si
+    mesmo ao montar (e, pior, ao desmontar) a posição.
+    """
+    if not min_adtv_brl:
+        return returns, {}
+
+    liquidity = load_liquidity(engine, list(returns.columns))
+    illiquid = {t: liquidity.get(t) for t in returns.columns
+                if liquidity.get(t) is None or liquidity[t] < min_adtv_brl}
+
+    if illiquid:
+        print(f"\nLiquidez abaixo do piso de R$ {min_adtv_brl:,.0f}/dia:")
+        for t, v in sorted(illiquid.items(), key=lambda x: (x[1] is not None, x[1])):
+            shown = f"R$ {v:,.0f}" if v is not None else "sem dado (rode compute_market_metrics.py)"
+            print(f"    {t}: {shown}")
+        if exclude:
+            keep = [t for t in returns.columns if t not in illiquid]
+            if len(keep) < MIN_TICKERS:
+                raise ValueError(
+                    f"Sobraram só {len(keep)} tickers acima do piso de liquidez - "
+                    f"baixe --min-liquidity ou escolha outros ativos."
+                )
+            print(f"  -> removidos da otimização ({len(keep)} tickers restantes).")
+            returns = returns[keep]
+        else:
+            print("  -> mantidos na otimização (use --exclude-illiquid para removê-los).")
+
+    return returns, illiquid
+
+
+def _annualized_mu_sigma(returns, covariance_method="ledoit_wolf"):
     """mu: retorno médio anualizado por ativo (pd.Series). S: matriz de
     covariância anualizada (pd.DataFrame). Convenção consistente com o resto
-    do projeto (log-retornos diários * 252)."""
+    do projeto (log-retornos diários * 252).
+
+    covariance_method:
+      'ledoit_wolf' (padrão) - encolhimento de Ledoit-Wolf. A covariância
+          amostral pura é um estimador ruidoso, principalmente quando o número
+          de ativos se aproxima do número de observações; o encolhimento puxa
+          a matriz em direção a um alvo estruturado, reduzindo o ruído. É o
+          estimador padrão da indústria e custa uma linha.
+      'sample' - covariância amostral pura, para comparação.
+    """
     mu = returns.mean() * TRADING_DAYS_PER_YEAR
-    S = returns.cov() * TRADING_DAYS_PER_YEAR
+
+    if covariance_method == "sample":
+        S = returns.cov() * TRADING_DAYS_PER_YEAR
+    elif covariance_method == "ledoit_wolf":
+        # CovarianceShrinkage espera preços por padrão; aqui já temos retornos,
+        # daí returns_data=True. frequency=252 anualiza direto.
+        S = risk_models.CovarianceShrinkage(
+            returns, returns_data=True, frequency=TRADING_DAYS_PER_YEAR
+        ).ledoit_wolf()
+    else:
+        raise ValueError(f"covariance_method desconhecido: {covariance_method}")
+
     return mu, S
 
 
@@ -156,7 +225,8 @@ def _solve_max_return(mu, min_weight, max_weight):
 
 
 def solve_frontier(returns, risk_free_rate_annual=0.0, min_weight=0.0, max_weight=1.0,
-                    n_frontier_points=DEFAULT_N_FRONTIER_POINTS, l2_gamma=0.0, mu_shrinkage=0.0):
+                    n_frontier_points=DEFAULT_N_FRONTIER_POINTS, l2_gamma=0.0, mu_shrinkage=0.0,
+                    covariance_method="ledoit_wolf"):
     """
     Resolve a fronteira eficiente EXATA via otimização convexa (PyPortfolioOpt/
     Markowitz) - em vez de simular portfólios aleatórios, resolve diretamente
@@ -185,7 +255,7 @@ def solve_frontier(returns, risk_free_rate_annual=0.0, min_weight=0.0, max_weigh
     de aumentar l2_gamma - é mais provável resolver o problema pela raiz.
     """
     tickers = list(returns.columns)
-    mu, S = _annualized_mu_sigma(returns)
+    mu, S = _annualized_mu_sigma(returns, covariance_method=covariance_method)
     if mu_shrinkage > 0:
         mu = _shrink_mu(mu, mu_shrinkage)
     bounds = (min_weight, max_weight)
@@ -332,6 +402,54 @@ def compute_benchmark_ann_return_pct(engine, lookback_days=DEFAULT_LOOKBACK_DAYS
     if r is None or r.empty:
         return None
     return float(r.mean() * TRADING_DAYS_PER_YEAR * 100)
+
+
+def _portfolio_stats(daily_returns, risk_free_rate_annual):
+    """Retorno/vol/Sharpe/Sortino anualizados de uma série de retornos diários,
+    na mesma convenção usada no resto do projeto."""
+    ann_return = float(daily_returns.mean() * TRADING_DAYS_PER_YEAR)
+    ann_vol = float(daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR))
+    downside = np.minimum(daily_returns.to_numpy(), 0) ** 2
+    downside_dev = float(np.sqrt(downside.mean() * TRADING_DAYS_PER_YEAR))
+    excess = ann_return - risk_free_rate_annual
+    return {
+        "ann_return_pct": round(ann_return * 100, 2),
+        "ann_vol_pct": round(ann_vol * 100, 2),
+        "sharpe": round(excess / ann_vol, 3) if ann_vol > 0 else None,
+        "sortino": round(excess / downside_dev, 3) if downside_dev > 0 else None,
+    }
+
+
+def compute_reference_portfolios(returns, risk_free_rate_annual, ibov_returns=None):
+    """
+    Carteiras de referência para checagem de sanidade:
+      - 1/N: peso igual entre todos os tickers, sem otimização nenhuma.
+      - Ibovespa: o mercado.
+
+    ATENÇÃO A UMA ARMADILHA DE INTERPRETAÇÃO: esta comparação é DENTRO DA
+    AMOSTRA (in-sample). A fronteira eficiente foi otimizada exatamente sobre
+    estes mesmos dados, então ela vai vencer a 1/N por construção - isso é
+    tautologia, não evidência de qualidade.
+
+    O teste que realmente importa (DeMiguel, Garlappi & Uppal, 2009) é FORA da
+    amostra: otimizar em uma janela, medir na janela seguinte, repetir. Isso
+    exige um motor de backtest walk-forward, que ainda não existe neste
+    projeto. Até lá, use estes números apenas para responder "quanto o
+    otimizador está ALEGANDO adicionar?" - não "quanto ele adiciona".
+    """
+    tickers = list(returns.columns)
+    refs = {}
+
+    equal_w = np.ones(len(tickers)) / len(tickers)
+    equal_series = pd.Series(returns.to_numpy() @ equal_w, index=returns.index)
+    refs["1/N (peso igual)"] = _portfolio_stats(equal_series, risk_free_rate_annual)
+    refs["1/N (peso igual)"]["weights_pct"] = {t: round(100 / len(tickers), 2) for t in tickers}
+
+    if ibov_returns is not None and not ibov_returns.empty:
+        refs["Ibovespa"] = _portfolio_stats(ibov_returns, risk_free_rate_annual)
+        refs["Ibovespa"]["weights_pct"] = None
+
+    return refs
 
 
 def find_optimal_portfolios(results, tickers):
@@ -640,6 +758,14 @@ def parse_args():
     parser.add_argument("--l2-gamma", type=float, default=0.0,
                          help="Regularização L2 (0 = desligada). Valores tipo 0.1-1 tendem a espalhar mais "
                               "os pesos, reduzindo carteiras 'grudadas' nos limites min/max-weight.")
+    parser.add_argument("--covariance", choices=["ledoit_wolf", "sample"], default="ledoit_wolf",
+                         help="Estimador de covariância. 'ledoit_wolf' (padrão) aplica encolhimento, "
+                              "reduzindo o ruído da matriz amostral. 'sample' usa a covariância pura.")
+    parser.add_argument("--min-liquidity", type=float, default=None,
+                         help="Piso de volume financeiro médio diário em R$ (ex: 1000000 para R$ 1 mi/dia). "
+                              "Por padrão só AVISA quais tickers ficam abaixo; use --exclude-illiquid para remover.")
+    parser.add_argument("--exclude-illiquid", action="store_true",
+                         help="Remove da otimização os tickers abaixo de --min-liquidity, em vez de só avisar.")
     parser.add_argument("--mu-shrinkage", type=float, default=0.0,
                          help="Encolhimento do retorno esperado em direção à média do grupo, de 0 (nenhum) "
                               "a 1 (todo ativo usa a mesma média). Ataca a causa mais comum de concentração "
@@ -692,14 +818,18 @@ def main():
     returns = load_returns(engine, args.tickers, lookback_days=args.lookback_days)
     print(f"  {returns.shape[0]} dias de pregão, {returns.shape[1]} tickers utilizáveis.")
 
+    if args.min_liquidity:
+        returns, _ = apply_liquidity_filter(engine, returns, args.min_liquidity, exclude=args.exclude_illiquid)
+
     print(f"\nResolvendo a fronteira eficiente ({args.n_frontier_points} pontos, via otimização convexa)...")
+    print(f"  covariância: {args.covariance}")
     if args.mu_shrinkage > 0:
         print(f"  encolhimento de retorno esperado ativado ({args.mu_shrinkage:.0%} em direção à média do grupo).")
     if args.l2_gamma > 0:
         print(f"  regularização L2 ativada (gamma={args.l2_gamma}) - deve reduzir concentração nos limites de peso.")
     frontier = solve_frontier(returns, risk_free_rate_annual=selic, min_weight=min_weight, max_weight=max_weight,
                                n_frontier_points=args.n_frontier_points, l2_gamma=args.l2_gamma,
-                               mu_shrinkage=args.mu_shrinkage)
+                               mu_shrinkage=args.mu_shrinkage, covariance_method=args.covariance)
 
     tickers_usados = list(returns.columns)
     best = find_optimal_portfolios(frontier, tickers_usados)
@@ -750,10 +880,28 @@ def main():
             top_holdings = ", ".join(f"{t} {w}%" for t, w in weights_sorted if w >= 1)
             print(f"    {top_holdings}")
 
+    ibov_returns = load_returns_aligned(engine, IBOVESPA_TICKER, returns.index)
+    refs = compute_reference_portfolios(returns, selic, ibov_returns=ibov_returns)
+
+    print("\n" + "=" * 60)
+    print("CHECAGEM DE SANIDADE - referências sem otimização")
+    print("=" * 60)
+    for name, stats in refs.items():
+        print(f"  {name:<22} retorno {stats['ann_return_pct']:>7.2f}%  |  vol {stats['ann_vol_pct']:>6.2f}%  |  "
+              f"Sharpe {stats['sharpe']:>6}  |  Sortino {stats['sortino']:>6}")
+    melhor_sharpe = best.get("maior_sharpe")
+    if melhor_sharpe and refs.get("1/N (peso igual)"):
+        delta = melhor_sharpe["sharpe"] - refs["1/N (peso igual)"]["sharpe"]
+        print(f"\n  Fronteira (maior Sharpe) vs 1/N: {delta:+.3f} de Sharpe")
+    print("\n  !! ATENÇÃO: esta comparação é DENTRO DA AMOSTRA. A fronteira foi otimizada")
+    print("     sobre exatamente estes dados, então vencer a 1/N aqui é tautologia, não")
+    print("     evidência. O teste que vale é fora da amostra (walk-forward), que exige um")
+    print("     motor de backtest ainda não implementado. Use os números acima só para")
+    print("     dimensionar quanto o otimizador ALEGA adicionar.")
+
     chart_path = plot_efficient_frontier(frontier, best, selic, intermediate=intermediate)
     print(f"\nGráfico da fronteira salvo em: {chart_path}")
 
-    ibov_returns = load_returns_aligned(engine, IBOVESPA_TICKER, returns.index)
     cum_chart_path = plot_cumulative_performance(returns, best, intermediate, ibov_returns, selic)
     print(f"Gráfico de retorno acumulado salvo em: {cum_chart_path}")
 
