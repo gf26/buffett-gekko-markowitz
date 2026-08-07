@@ -248,7 +248,7 @@ def benchmark_curve(prices_adj, dates, ticker):
             continue
         r = float(w.iloc[-1] / w.iloc[0] - 1)
         eq *= (1 + r)
-        out.append({"date": d, "return_pct": r * 100, "equity": eq})
+        out.append({"date": d, "next_date": dates[i + 1], "return_pct": r * 100, "equity": eq})
     return pd.DataFrame(out)
 
 
@@ -265,8 +265,23 @@ def universe_equal_weight_curve(prices_adj, dates, adtv_map, min_adtv):
         if rets.empty:
             continue
         eq *= (1 + float(rets.mean()))
-        out.append({"date": d, "return_pct": float(rets.mean()) * 100, "equity": eq})
+        out.append({"date": d, "next_date": dates[i + 1], "return_pct": float(rets.mean()) * 100, "equity": eq})
     return pd.DataFrame(out)
+
+
+def anchor_curve(df):
+    """Prepara a curva para exibição/análise: adiciona um ponto de ANCORAGEM
+    (retorno 0%, equity=1.0) na primeira data de rebalanceamento, e usa a
+    data de FIM de cada período (next_date) para os pontos seguintes - não a
+    de início. Sem isso, o primeiro ponto plotado já vem com o retorno do
+    primeiro período embutido (nunca existe um "antes de qualquer coisa
+    acontecer" na curva), e o drawdown a partir do capital inicial fica
+    subestimado se o primeiro período for de perda."""
+    if df is None or df.empty:
+        return df
+    anchor = {"date": df["date"].iloc[0], "equity": 1.0}
+    display_rows = [anchor] + [{"date": r["next_date"], "equity": r["equity"]} for _, r in df.iterrows()]
+    return pd.DataFrame(display_rows)
 
 
 def summarize(name, df, periods_per_year=4):
@@ -279,7 +294,9 @@ def summarize(name, df, periods_per_year=4):
     vol = rets.std() * np.sqrt(periods_per_year)
     downside = np.minimum(rets, 0) ** 2
     dd_dev = np.sqrt(downside.mean() * periods_per_year)
-    curve = df["equity"]
+    # drawdown a partir do capital inicial (equity=1.0), não só entre os
+    # pontos já registrados - captura uma queda logo no primeiro período
+    curve = pd.concat([pd.Series([1.0]), df["equity"]], ignore_index=True)
     max_dd = float((curve / curve.cummax() - 1).min())
     return {
         "estratégia": name, "retorno_total_pct": round(total * 100, 2),
@@ -405,7 +422,7 @@ def main():
     if summaries:
         print(pd.DataFrame(summaries).to_string(index=False))
 
-    path = plot_backtest(curves)
+    path = plot_backtest({name: anchor_curve(df) for name, df in curves.items()})
     print(f"\nGráfico salvo em: {path}")
 
     print("\n" + "!" * 78)
