@@ -366,17 +366,42 @@ def main():
         adtv_rows = conn.execute(text("SELECT ticker, avg_daily_value_brl FROM market_metrics")).fetchall()
     adtv_map = {r[0]: (float(r[1]) if r[1] is not None else None) for r in adtv_rows}
 
+    curves_full = {
+        "1/N do universo (histórico completo)": universe_equal_weight_curve(prices_adj, dates, adtv_map, args.min_adtv),
+        "Ibovespa (histórico completo)": benchmark_curve(prices_adj, dates, "^BVSP"),
+    }
+
+    strategy_dates = sorted({h["date"] for h in history["markowitz"]} | {h["date"] for h in history["equal"]})
+    if strategy_dates:
+        matched_dates = [d for d in dates if d >= strategy_dates[0]]
+    else:
+        matched_dates = dates
+
     curves = {
         "Estratégia (Markowitz)": pd.DataFrame(history["markowitz"]),
         "Estratégia (peso igual)": pd.DataFrame(history["equal"]),
-        "1/N do universo": universe_equal_weight_curve(prices_adj, dates, adtv_map, args.min_adtv),
-        "Ibovespa": benchmark_curve(prices_adj, dates, "^BVSP"),
+        "1/N do universo": universe_equal_weight_curve(prices_adj, matched_dates, adtv_map, args.min_adtv),
+        "Ibovespa": benchmark_curve(prices_adj, matched_dates, "^BVSP"),
     }
 
+    ppy = PERIODS_PER_YEAR[args.rebalance_freq]
+
+    if strategy_dates:
+        print("\n" + "=" * 78)
+        print(f"CONTEXTO - histórico completo das referências (desde {dates[0].date()}, {len(dates)-1} períodos)")
+        print("A Estratégia não existe nesta janela inteira - ela só começa a operar quando o")
+        print("primeiro conjunto de fundamentos fica disponível. Esta tabela é só para você ver")
+        print("o que o mercado fez ANTES da estratégia poder existir.")
+        print("=" * 78)
+        full_summaries = [s for s in (summarize(n, d, periods_per_year=ppy) for n, d in curves_full.items()) if s]
+        if full_summaries:
+            print(pd.DataFrame(full_summaries).to_string(index=False))
+
     print("\n" + "=" * 78)
-    print("RESULTADO (fora da amostra)")
+    print(f"RESULTADO (fora da amostra) - PERÍODO COMPARÁVEL, desde {strategy_dates[0].date() if strategy_dates else dates[0].date()}")
+    print("Esta é a comparação justa: todas as 4 curvas medidas na MESMA janela.")
     print("=" * 78)
-    summaries = [s for s in (summarize(n, d, periods_per_year=PERIODS_PER_YEAR[args.rebalance_freq]) for n, d in curves.items()) if s]
+    summaries = [s for s in (summarize(n, d, periods_per_year=ppy) for n, d in curves.items()) if s]
     if summaries:
         print(pd.DataFrame(summaries).to_string(index=False))
 
