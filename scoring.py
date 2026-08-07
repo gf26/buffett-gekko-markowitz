@@ -97,10 +97,20 @@ def load_shares_outstanding(engine):
 # Fatiamento point-in-time
 # ============================================================
 
-def snapshot_financials(all_fin, as_of, use_first_seen=True):
+def snapshot_financials(all_fin, as_of, use_first_seen=False):
     """Para cada (ticker, statement, line_item), o valor do exercício mais
     recente que já era público em `as_of`. Devolve também o penúltimo
-    exercício (LFY-1), necessário para Piotroski e taxas de crescimento."""
+    exercício (LFY-1), necessário para Piotroski e taxas de crescimento.
+
+    use_first_seen=False por padrão: a coluna `first_seen_at` foi criada com
+    DEFAULT now() - toda linha JÁ EXISTENTE na tabela ganhou first_seen_at =
+    data da migração, não a data real de publicação. Usar isso para
+    reconstruir datas anteriores à migração filtra TUDO fora (first_seen_at
+    sempre "recente" > qualquer as_of do passado), zerando o backtest
+    silenciosamente. first_seen_at só passa a ser um proxy válido para dados
+    coletados DAQUI PRA FRENTE - vale religar (use_first_seen=True) depois
+    que o sistema tiver rodado por tempo suficiente para first_seen_at
+    refletir chegada de dado de verdade, não a data da migração."""
     as_of = pd.Timestamp(as_of)
     mask = all_fin["available_from"] <= as_of
     if use_first_seen:
