@@ -59,9 +59,27 @@ DEFAULT_MIN_HISTORY_DAYS = 250   # histórico mínimo ATÉ a data de rebalanceam
 DEFAULT_MIN_ADTV = 50_000        # piso de liquidez, R$/dia
 
 
-def quarter_starts(start, end):
-    """Primeiro dia de cada trimestre no intervalo."""
-    return pd.date_range(start=start, end=end, freq="QS")
+REBALANCE_FREQUENCIES = {"monthly": 1, "quarterly": 3, "semiannual": 6, "annual": 12}  # passo em meses
+PERIODS_PER_YEAR = {"monthly": 12, "quarterly": 4, "semiannual": 2, "annual": 1}
+
+
+def rebalance_dates(start, end, frequency="quarterly"):
+    """Datas de rebalanceamento no intervalo, na frequência pedida
+    ('monthly', 'quarterly', 'semiannual' ou 'annual'). Construção manual via
+    DateOffset (em vez de aliases de frequência do pandas, como 'QS'/'AS') de
+    propósito: esses aliases mudaram entre versões do pandas (ex: 'AS' foi
+    descontinuado em favor de 'YS'), e isso quebraria dependendo de qual
+    pandas estiver instalado no ambiente."""
+    if frequency not in REBALANCE_FREQUENCIES:
+        raise ValueError(f"frequency deve ser um de {list(REBALANCE_FREQUENCIES)}, recebi '{frequency}'")
+    step_months = REBALANCE_FREQUENCIES[frequency]
+    end = pd.Timestamp(end)
+    current = pd.Timestamp(start).replace(day=1)
+    dates = []
+    while current <= end:
+        dates.append(current)
+        current = current + pd.DateOffset(months=step_months)
+    return pd.DatetimeIndex(dates)
 
 
 def nearest_trading_day(prices_index, target):
@@ -157,7 +175,7 @@ def run_backtest(engine, args):
     first_available = all_fin["available_from"].min()
     start = max(pd.Timestamp(first_available), prices_adj.index.min() + pd.Timedelta(days=365))
     end = prices_adj.index.max()
-    dates = [d for d in quarter_starts(start, end)]
+    dates = [d for d in rebalance_dates(start, end, frequency=args.rebalance_freq)]
     dates = [nearest_trading_day(prices_adj.index, d) for d in dates]
     dates = [d for d in dates if d is not None]
 
@@ -309,6 +327,10 @@ def plot_backtest(curves, output_path="backtest_equity.png"):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Backtest walk-forward do screener + otimizador.")
+    p.add_argument("--rebalance-freq", choices=list(REBALANCE_FREQUENCIES), default="quarterly",
+                    help="Frequência de rebalanceamento. Padrão: quarterly. "
+                         "'monthly' NÃO aumenta a informação disponível (fundamentos só mudam "
+                         "a cada divulgação) - ver aviso impresso no resultado.")
     p.add_argument("--n-assets", type=int, default=DEFAULT_N_ASSETS)
     p.add_argument("--piotroski-min", type=int, default=DEFAULT_PIOTROSKI_MIN,
                     help="Piso do F-Score. Use 0 para desligar o filtro.")
@@ -352,7 +374,7 @@ def main():
     print("\n" + "=" * 78)
     print("RESULTADO (fora da amostra)")
     print("=" * 78)
-    summaries = [s for s in (summarize(n, d) for n, d in curves.items()) if s]
+    summaries = [s for s in (summarize(n, d, periods_per_year=PERIODS_PER_YEAR[args.rebalance_freq]) for n, d in curves.items()) if s]
     if summaries:
         print(pd.DataFrame(summaries).to_string(index=False))
 
@@ -367,6 +389,11 @@ def main():
     print("  3. Não inclui imposto de renda.")
     print("  4. Se a estratégia não superar '1/N do universo' de forma consistente,")
     print("     a complexidade do screener + otimizador não está se pagando.")
+    if args.rebalance_freq == "monthly":
+        print("  5. Frequência mensal: os fundamentos só mudam a cada divulgação (trimestral,")
+        print("     no máximo) - a maioria dos rebalanceamentos mensais reage ao MESMO retrato")
+        print("     fundamentalista de antes, só com preço diferente. Mais pontos na curva não")
+        print("     significa mais informação independente; e o turnover extra tem custo real.")
     print("!" * 78)
 
 
