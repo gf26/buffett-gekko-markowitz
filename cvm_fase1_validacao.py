@@ -53,10 +53,37 @@ CVM_DFP_URL = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/DFP/DADOS/dfp_cia_a
 
 # Contas CVM que vamos comparar com o Yahoo nesta prova de conceito.
 # (o de-para completo vem na Fase 2 - aqui só o suficiente para validar)
+#
+# Sobre Patrimônio Líquido e Lucro Líquido: a CVM reporta o valor CONSOLIDADO
+# (2.03 e 3.11), que INCLUI a participação de não-controladores (minoritários).
+# O Yahoo usa a convenção de reportar o atribuível aos CONTROLADORES. Por isso
+# testamos as duas variantes: a conta cheia e a subconta dos controladores.
 CONTAS_TESTE = {
     "BPA": {"1": "Total Assets", "1.01": "Current Assets"},
-    "BPP": {"2.01": "Current Liabilities", "2.03": "Stockholders Equity"},
-    "DRE": {"3.01": "Total Revenue", "3.03": "Gross Profit", "3.11": "Net Income"},
+    "BPP": {
+        "2.01": "Current Liabilities",
+        "2.03": "Stockholders Equity (consolidado)",
+        "2.03.09": "_minoritarios_pl",
+    },
+    "DRE": {
+        "3.01": "Total Revenue",
+        "3.03": "Gross Profit",
+        "3.11": "Net Income (consolidado)",
+        "3.11.01": "Net Income (controladores)",
+    },
+}
+
+# Como cada variante da CVM deve ser comparada com o Yahoo
+EQUIVALENCIAS = {
+    "Total Assets": "Total Assets",
+    "Current Assets": "Current Assets",
+    "Current Liabilities": "Current Liabilities",
+    "Total Revenue": "Total Revenue",
+    "Gross Profit": "Gross Profit",
+    "Stockholders Equity (consolidado)": "Stockholders Equity",
+    "Stockholders Equity (controladores)": "Stockholders Equity",
+    "Net Income (consolidado)": "Net Income",
+    "Net Income (controladores)": "Net Income",
 }
 
 ESCALA = {"UNIDADE": 1, "MIL": 1_000, "MILHAR": 1_000, "MILHÃO": 1_000_000, "MILHAO": 1_000_000}
@@ -165,6 +192,21 @@ def main():
     cvm = pd.concat(frames, ignore_index=True)
     print(f"\nCVM: {cvm['CD_CVM'].nunique()} empresas, {len(cvm)} linhas de conta lidas.")
 
+    # Deriva o PL atribuível aos CONTROLADORES = consolidado - minoritários.
+    # (o Lucro Líquido dos controladores já vem pronto na subconta 3.11.01)
+    wide = cvm.pivot_table(index=["CNPJ_CIA", "DENOM_CIA", "CD_CVM", "DT_FIM_EXERC"],
+                           columns="line_item", values="VL_CONTA", aggfunc="first").reset_index()
+    if "Stockholders Equity (consolidado)" in wide.columns:
+        minor = wide["_minoritarios_pl"] if "_minoritarios_pl" in wide.columns else 0
+        wide["Stockholders Equity (controladores)"] = (
+            wide["Stockholders Equity (consolidado)"] - pd.to_numeric(minor, errors="coerce").fillna(0)
+        )
+    cvm = wide.melt(id_vars=["CNPJ_CIA", "DENOM_CIA", "CD_CVM", "DT_FIM_EXERC"],
+                    var_name="line_item", value_name="VL_CONTA").dropna(subset=["VL_CONTA"])
+    cvm = cvm[cvm["line_item"] != "_minoritarios_pl"]
+    cvm["equiv_yahoo"] = cvm["line_item"].map(EQUIVALENCIAS)
+    cvm = cvm.dropna(subset=["equiv_yahoo"])
+
     # --- casamento por nome ---
     tickers = carregar_tickers_do_banco(engine)
     cvm["nome_norm"] = cvm["DENOM_CIA"].apply(normalizar_nome)
@@ -182,33 +224,51 @@ def main():
         raise SystemExit(f"Sem dados do Yahoo para exercícios de {args.ano} no banco - tente outro ano.")
 
     comp = casados.merge(
-        yahoo, on=["ticker", "line_item"], how="inner", suffixes=("_cvm", "_yahoo")
+        yahoo, left_on=["ticker", "equiv_yahoo"], right_on=["ticker", "line_item"],
+        how="inner", suffixes=("_cvm", "_yahoo")
     )
     if comp.empty:
         raise SystemExit("Nenhum par (ticker, conta) em comum entre CVM e Yahoo para comparar.")
 
     comp["valor_cvm"] = comp["VL_CONTA"].astype(float)
     comp["valor_yahoo"] = comp["value"].astype(float)
-    comp["dif_pct"] = ((comp["valor_cvm"] - comp["valor_yahoo"]).abs()
-                        / comp["valor_yahoo"].abs().replace(0, pd.NA) * 100)
+    # pd.NA (do guarda contra divisão por zero) transforma a coluna inteira em
+    # object; to_numeric devolve float com NaN, que nlargest/median aceitam
+    comp["dif_pct"] = pd.to_numeric(
+        (comp["valor_cvm"] - comp["valor_yahoo"]).abs()
+        / comp["valor_yahoo"].abs().replace(0, pd.NA) * 100,
+        errors="coerce",
+    )
     comp["bate"] = comp["dif_pct"] <= args.tolerancia
 
     print("\n" + "=" * 78)
     print(f"VALIDAÇÃO CVM x YAHOO - exercício {args.ano} (tolerância {args.tolerancia}%)")
     print("=" * 78)
     print(f"Pares comparados: {len(comp)}  |  tickers distintos: {comp['ticker'].nunique()}")
-    taxa = comp["bate"].mean() * 100
-    print(f"Concordância geral: {taxa:.1f}%")
 
-    print("\nPor conta:")
-    por_conta = comp.groupby("line_item").agg(
+    print("\nPor conta da CVM (as variantes 'consolidado' e 'controladores' competem entre si -")
+    print("a que tiver MAIOR concordância é a que devemos usar no de-para da Fase 2):")
+    por_conta = comp.groupby("line_item_cvm").agg(
         pares=("bate", "size"), concordancia_pct=("bate", lambda s: round(s.mean() * 100, 1)),
         dif_mediana_pct=("dif_pct", lambda s: round(s.median(), 2)),
     ).sort_values("concordancia_pct")
     print(por_conta.to_string())
 
+    # taxa geral considerando, para cada conceito, só a melhor variante
+    melhor_por_conceito = (comp.groupby(["equiv_yahoo", "line_item_cvm"])["bate"].mean()
+                             .reset_index().sort_values("bate", ascending=False)
+                             .drop_duplicates("equiv_yahoo"))
+    escolhidas = set(melhor_por_conceito["line_item_cvm"])
+    comp_melhor = comp[comp["line_item_cvm"].isin(escolhidas)]
+    taxa = comp_melhor["bate"].mean() * 100
+    print(f"\nConcordância usando a MELHOR variante de cada conceito: {taxa:.1f}%")
+    print("Mapeamento vencedor (é isto que vai para o de-para da Fase 2):")
+    for _, r in melhor_por_conceito.iterrows():
+        print(f"    {r['equiv_yahoo']:<22} <- CVM: {r['line_item_cvm']}  ({r['bate']*100:.1f}%)")
+
     print("\n10 maiores divergências (para inspeção manual):")
-    piores = comp.nlargest(10, "dif_pct")[["ticker", "DENOM_CIA", "line_item", "valor_cvm", "valor_yahoo", "dif_pct"]]
+    piores = comp_melhor.nlargest(10, "dif_pct")[
+        ["ticker", "DENOM_CIA", "line_item_cvm", "valor_cvm", "valor_yahoo", "dif_pct"]]
     print(piores.to_string(index=False))
 
     print("\n" + "=" * 78)
