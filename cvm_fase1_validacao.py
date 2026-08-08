@@ -142,8 +142,18 @@ def normalizar_nome(nome):
 
 
 def carregar_tickers_do_banco(engine):
+    """Além do nome (para casar com a CVM), traz a MOEDA em que o Yahoo
+    reporta os demonstrativos e o setor - as duas causas suspeitas das
+    divergências restantes."""
     with engine.connect() as conn:
-        df = pd.read_sql(text("SELECT ticker, name FROM tickers WHERE name IS NOT NULL"), conn)
+        df = pd.read_sql(text("""
+            SELECT t.ticker, t.name,
+                   ci.info->>'financialCurrency' AS moeda_yahoo,
+                   ci.info->>'sector'            AS setor
+            FROM tickers t
+            LEFT JOIN company_info ci ON ci.ticker = t.ticker
+            WHERE t.name IS NOT NULL
+        """), conn)
     df["nome_norm"] = df["name"].apply(normalizar_nome)
     return df
 
@@ -271,12 +281,47 @@ def main():
         ["ticker", "DENOM_CIA", "line_item_cvm", "valor_cvm", "valor_yahoo", "dif_pct"]]
     print(piores.to_string(index=False))
 
+    # ---- diagnóstico das causas ----
+    print("\n" + "-" * 78)
+    print("DIAGNÓSTICO DAS DIVERGÊNCIAS RESTANTES")
+    print("-" * 78)
+
+    comp_melhor = comp_melhor.copy()
+    comp_melhor["razao"] = comp_melhor["valor_cvm"] / comp_melhor["valor_yahoo"].replace(0, pd.NA)
+
+    print("\n1) Por moeda em que o Yahoo reporta (a CVM é sempre em BRL):")
+    por_moeda = comp_melhor.groupby(comp_melhor["moeda_yahoo"].fillna("(sem info)")).agg(
+        pares=("bate", "size"), concordancia_pct=("bate", lambda s: round(s.mean() * 100, 1)),
+        razao_mediana=("razao", lambda s: round(s.median(), 3)),
+    )
+    print(por_moeda.to_string())
+    print("   -> se alguma moeda != BRL tiver concordância baixa E razão mediana perto do")
+    print("      câmbio da época, é conversão de moeda - não erro de dado.")
+
+    print("\n2) Por setor (bancos/seguradoras usam plano de contas próprio na CVM):")
+    por_setor = comp_melhor.groupby(comp_melhor["setor"].fillna("(sem info)")).agg(
+        pares=("bate", "size"), concordancia_pct=("bate", lambda s: round(s.mean() * 100, 1)),
+    ).sort_values("concordancia_pct")
+    print(por_setor.head(8).to_string())
+
+    # taxa "limpa": só empresas que reportam em BRL e fora do setor financeiro
+    limpo = comp_melhor[
+        (comp_melhor["moeda_yahoo"].fillna("BRL") == "BRL")
+        & (~comp_melhor["setor"].fillna("").isin(["Financial Services"]))
+    ]
+    if not limpo.empty:
+        taxa_limpa = limpo["bate"].mean() * 100
+        print(f"\n3) Concordância excluindo reportadoras em moeda estrangeira e setor financeiro:")
+        print(f"   {taxa_limpa:.1f}%  ({len(limpo)} pares, {limpo['ticker'].nunique()} tickers)")
+        print("   -> este é o número que indica se o parsing em si está correto.")
+
     print("\n" + "=" * 78)
     if taxa >= 90:
         print("VEREDITO: alta concordância. A fonte é compatível - vale seguir para a Fase 2.")
     elif taxa >= 70:
-        print("VEREDITO: concordância parcial. Provavelmente diferenças de critério (consolidado x")
-        print("individual, reapresentações). Investigar as divergências acima antes de seguir.")
+        print("VEREDITO: concordância parcial. Veja o diagnóstico acima: se as divergências se")
+        print("concentram em moeda estrangeira e setor financeiro, são casos tratáveis na Fase 2")
+        print("(converter moeda; plano de contas específico para bancos) - não impedimento.")
     else:
         print("VEREDITO: concordância baixa. NÃO seguir para a Fase 2 antes de entender a causa -")
         print("pode ser erro de parsing (escala, ORDEM_EXERC) ou casamento errado de empresas.")
