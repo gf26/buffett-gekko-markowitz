@@ -117,6 +117,16 @@ def ler_demonstrativo(zf, ano, sigla, consolidado=True):
     # duplicaria tudo se não filtrássemos)
     if "ORDEM_EXERC" in df.columns:
         df = df[df["ORDEM_EXERC"] == "ÚLTIMO"]
+    # Reapresentações: quando a empresa corrige um demonstrativo já publicado,
+    # o arquivo passa a conter mais de uma VERSAO para o mesmo período. Ficamos
+    # com a mais recente (a versão corrigida) - sem isso, valores concorrentes
+    # convivem e o pivot escolhe um arbitrariamente.
+    if "VERSAO" in df.columns and not df.empty:
+        df["VERSAO"] = pd.to_numeric(df["VERSAO"], errors="coerce")
+        chaves = ["CNPJ_CIA", "DT_FIM_EXERC", "CD_CONTA"]
+        chaves = [c for c in chaves if c in df.columns]
+        if chaves:
+            df = df.sort_values("VERSAO").drop_duplicates(chaves, keep="last")
     # normaliza a escala: alguns documentos vêm em milhares
     if "ESCALA_MOEDA" in df.columns:
         fator = df["ESCALA_MOEDA"].str.upper().map(ESCALA).fillna(1)
@@ -289,14 +299,28 @@ def main():
     comp_melhor = comp_melhor.copy()
     comp_melhor["razao"] = comp_melhor["valor_cvm"] / comp_melhor["valor_yahoo"].replace(0, pd.NA)
 
-    print("\n1) Por moeda em que o Yahoo reporta (a CVM é sempre em BRL):")
-    por_moeda = comp_melhor.groupby(comp_melhor["moeda_yahoo"].fillna("(sem info)")).agg(
-        pares=("bate", "size"), concordancia_pct=("bate", lambda s: round(s.mean() * 100, 1)),
-        razao_mediana=("razao", lambda s: round(s.median(), 3)),
-    )
-    print(por_moeda.to_string())
-    print("   -> se alguma moeda != BRL tiver concordância baixa E razão mediana perto do")
-    print("      câmbio da época, é conversão de moeda - não erro de dado.")
+    print("\n1) Divergências com RAZÃO SISTEMÁTICA (mesmo fator em várias contas do mesmo")
+    print("   ticker) - sinal de diferença de MOEDA ou ESCALA, não de dado errado:")
+    ruins = comp_melhor[~comp_melhor["bate"]].dropna(subset=["razao"])
+    if not ruins.empty:
+        por_ticker = ruins.groupby("ticker").agg(
+            contas_divergentes=("razao", "size"),
+            razao_mediana=("razao", "median"),
+            razao_desvio=("razao", "std"),
+        )
+        # razão parecida em >=3 contas do mesmo ticker = fator sistemático
+        sistematicos = por_ticker[(por_ticker["contas_divergentes"] >= 3)
+                                   & (por_ticker["razao_desvio"].fillna(0) < 0.05)]
+        if not sistematicos.empty:
+            print(sistematicos.sort_values("contas_divergentes", ascending=False).head(15).to_string())
+            print(f"\n   -> {len(sistematicos)} tickers com fator sistemático. Se a razão estiver perto")
+            print("      de 5-6, é BRL/USD (empresa reporta em dólar no Yahoo, em real na CVM).")
+            print("      Nesses casos o dado da CVM é o correto para um sistema em BRL.")
+        else:
+            print("   nenhum fator sistemático claro encontrado.")
+        tickers_sistematicos = set(sistematicos.index)
+    else:
+        tickers_sistematicos = set()
 
     print("\n2) Por setor (bancos/seguradoras usam plano de contas próprio na CVM):")
     por_setor = comp_melhor.groupby(comp_melhor["setor"].fillna("(sem info)")).agg(
@@ -304,14 +328,14 @@ def main():
     ).sort_values("concordancia_pct")
     print(por_setor.head(8).to_string())
 
-    # taxa "limpa": só empresas que reportam em BRL e fora do setor financeiro
+    # taxa "limpa": fora do setor financeiro e sem os casos de moeda/escala
     limpo = comp_melhor[
-        (comp_melhor["moeda_yahoo"].fillna("BRL") == "BRL")
+        (~comp_melhor["ticker"].isin(tickers_sistematicos))
         & (~comp_melhor["setor"].fillna("").isin(["Financial Services"]))
     ]
     if not limpo.empty:
         taxa_limpa = limpo["bate"].mean() * 100
-        print(f"\n3) Concordância excluindo reportadoras em moeda estrangeira e setor financeiro:")
+        print(f"\n3) Concordância excluindo casos de moeda/escala e setor financeiro:")
         print(f"   {taxa_limpa:.1f}%  ({len(limpo)} pares, {limpo['ticker'].nunique()} tickers)")
         print("   -> este é o número que indica se o parsing em si está correto.")
 
