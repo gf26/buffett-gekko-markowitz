@@ -73,6 +73,12 @@ def baixar_empresas_cvm(ano):
     with zf.open(nome_arq) as f:
         df = pd.read_csv(f, sep=";", encoding="latin-1",
                           dtype={"CNPJ_CIA": str, "CD_CVM": str})
+    if "CD_CVM" in df.columns:
+        # normaliza zeros à esquerda - alguns arquivos da CVM trazem o código
+        # com padding ("001023"), outros não ("1023"); sem isso, o mesmo
+        # código vira "duas empresas diferentes" ao comparar/casar tabelas
+        df["CD_CVM"] = df["CD_CVM"].str.strip().str.lstrip("0")
+        df.loc[df["CD_CVM"] == "", "CD_CVM"] = "0"
     cols = [c for c in ["CNPJ_CIA", "DENOM_CIA", "CD_CVM"] if c in df.columns]
     empresas = df[cols].drop_duplicates("CD_CVM").reset_index(drop=True)
     empresas["nome_norm"] = empresas["DENOM_CIA"].apply(normalizar_nome)
