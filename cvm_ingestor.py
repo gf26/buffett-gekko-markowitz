@@ -126,8 +126,16 @@ def ler_csv(zf, nome):
     if nome not in zf.namelist():
         return pd.DataFrame()
     with zf.open(nome) as f:
-        return pd.read_csv(f, sep=";", encoding="latin-1", decimal=".",
-                            dtype={"CD_CONTA": str, "CNPJ_CIA": str, "CD_CVM": str})
+        df = pd.read_csv(f, sep=";", encoding="latin-1", decimal=".",
+                          dtype={"CD_CONTA": str, "CNPJ_CIA": str, "CD_CVM": str})
+    if "CD_CVM" in df.columns:
+        # os arquivos detalhados (BPA/BPP/DRE/DFC) trazem o código CVM com
+        # zeros à esquerda ("001023"); o arquivo resumo e a tabela de
+        # mapeamento não ("1023") - normalizando aqui, uma vez só, evita que
+        # todo o resto do pipeline precise se preocupar com isso.
+        df["CD_CVM"] = df["CD_CVM"].str.strip().str.lstrip("0")
+        df.loc[df["CD_CVM"] == "", "CD_CVM"] = "0"
+    return df
 
 
 def preparar(df):
@@ -136,17 +144,15 @@ def preparar(df):
     if df.empty:
         return df
     if "ORDEM_EXERC" in df.columns:
-        df = df[df["ORDEM_EXERC"] == "ÚLTIMO"]
+        df = df[df["ORDEM_EXERC"] == "ÚLTIMO"].copy()
     if "CD_CONTA" in df.columns:
         df["CD_CONTA"] = df["CD_CONTA"].str.strip()
     if "VERSAO" in df.columns and not df.empty:
-        df = df.copy()
         df["VERSAO"] = pd.to_numeric(df["VERSAO"], errors="coerce")
         chaves = [c for c in ["CNPJ_CIA", "DT_FIM_EXERC", "CD_CONTA"] if c in df.columns]
         if chaves:
             df = df.sort_values("VERSAO").drop_duplicates(chaves, keep="last")
     if "ESCALA_MOEDA" in df.columns:
-        df = df.copy()
         fator = df["ESCALA_MOEDA"].str.upper().map(ESCALA).fillna(1)
         df["VL_CONTA"] = pd.to_numeric(df["VL_CONTA"], errors="coerce") * fator
     return df
