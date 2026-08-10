@@ -107,7 +107,7 @@ DEMONSTRATIVOS = [
 
 # CapEx: sem código fixo na CVM, procuramos por descrição em subcontas de 6.02
 PADRAO_CAPEX = re.compile(
-    r"(aquisi\w*|compra\w*|adi\w*)\s+.*(imobilizado|ativo\s+imobilizado|intang)", re.IGNORECASE
+    r"(?:aquisi\w*|compra\w*|adi\w*)\s+.*(?:imobilizado|ativo\s+imobilizado|intang)", re.IGNORECASE
 )
 
 
@@ -201,26 +201,45 @@ def acoes_em_circulacao(zf, ano, prefixo):
     return agg
 
 
-def processar_ano(zf, ano, prefixo, period_type, mapa_ticker):
+def processar_ano(zf, ano, prefixo, period_type, mapa_ticker, debug=False):
     """Devolve as linhas prontas para inserir em `financials`."""
     pubs = datas_publicacao(zf, ano, prefixo)
     frames = []
 
     for sigla, contas, statement in DEMONSTRATIVOS:
-        df = preparar(ler_csv(zf, f"{prefixo}_cia_aberta_{sigla}_con_{ano}.csv"))
+        nome_arq = f"{prefixo}_cia_aberta_{sigla}_con_{ano}.csv"
+        bruto = ler_csv(zf, nome_arq)
+        if debug:
+            print(f"    [{sigla}] arquivo={nome_arq!r} existe_no_zip={nome_arq in zf.namelist()} linhas_brutas={len(bruto)}")
+        df = preparar(bruto)
         if df.empty:
+            if debug:
+                print(f"    [{sigla}] vazio após preparar() - pulando")
             continue
+        if debug:
+            contas_no_arquivo = set(df["CD_CONTA"].unique())
+            contas_esperadas = set(contas.keys())
+            print(f"    [{sigla}] contas esperadas: {sorted(contas_esperadas)}")
+            print(f"    [{sigla}] intersecção com o arquivo: {sorted(contas_esperadas & contas_no_arquivo)}")
         df = df[df["CD_CONTA"].isin(contas)].copy()
         if df.empty:
+            if debug:
+                print(f"    [{sigla}] nenhuma conta do de-para encontrada neste arquivo - pulando")
             continue
         df["line_item"] = df["CD_CONTA"].map(contas)
         df["statement"] = statement
         frames.append(df[["CD_CVM", "DT_REFER", "DT_FIM_EXERC", "statement", "line_item", "VL_CONTA"]])
+        if debug:
+            print(f"    [{sigla}] {len(df)} linhas aproveitadas")
 
     if not frames:
+        if debug:
+            print("    nenhum demonstrativo produziu linhas - retornando vazio")
         return []
 
     dados = pd.concat(frames, ignore_index=True)
+    if debug:
+        print(f"    total após concat: {len(dados)} linhas, {dados['CD_CVM'].nunique()} empresas")
 
     # Patrimônio Líquido dos controladores = total - minoritários
     piv = dados[dados["statement"] == "balance_sheet"].pivot_table(
@@ -261,19 +280,38 @@ def processar_ano(zf, ano, prefixo, period_type, mapa_ticker):
                                           "statement", "line_item", "VL_CONTA"]]], ignore_index=True)
 
     dados = dados.dropna(subset=["VL_CONTA"])
+    if debug:
+        print(f"    após dropna(VL_CONTA): {len(dados)} linhas")
     dados["fiscal_date"] = pd.to_datetime(dados["DT_FIM_EXERC"], errors="coerce").dt.date
+    antes = len(dados)
     dados = dados.dropna(subset=["fiscal_date"])
+    if debug:
+        print(f"    após parse de fiscal_date: {len(dados)} linhas (de {antes} - "
+              f"{antes - len(dados)} tinham DT_FIM_EXERC ilegível)")
 
     # explode empresa -> tickers (PETR3 e PETR4 compartilham os fundamentos)
     linhas = []
+    cd_cvm_sem_mapa = set()
     for _, r in dados.iterrows():
-        tickers = mapa_ticker.get(str(r["CD_CVM"]))
+        cd = str(r["CD_CVM"]).strip()
+        tickers = mapa_ticker.get(cd)
         if not tickers:
+            cd_cvm_sem_mapa.add(cd)
             continue
-        pub = pubs.get((str(r["CD_CVM"]), str(r["DT_REFER"])[:10])) or pubs.get(str(r["CD_CVM"]))
+        pub = pubs.get((cd, str(r["DT_REFER"])[:10])) or pubs.get(cd)
         for tk in tickers:
             linhas.append((tk, r["statement"], period_type, r["fiscal_date"],
                             r["line_item"], float(r["VL_CONTA"]), pub, "cvm"))
+    if debug:
+        cds_no_dados = set(str(c).strip() for c in dados["CD_CVM"].unique())
+        cds_no_mapa = set(mapa_ticker.keys())
+        print(f"    códigos CVM nos dados: {len(cds_no_dados)}  |  códigos CVM no mapa: {len(cds_no_mapa)}")
+        print(f"    intersecção (deveriam gerar linhas): {len(cds_no_dados & cds_no_mapa)}")
+        if cd_cvm_sem_mapa:
+            exemplos = sorted(cd_cvm_sem_mapa)[:5]
+            print(f"    {len(cd_cvm_sem_mapa)} códigos CVM nos dados SEM mapeamento - exemplos: {exemplos}")
+        exemplos_mapa = sorted(cds_no_mapa)[:5]
+        print(f"    exemplos de códigos que ESTÃO no mapa: {exemplos_mapa}")
     return linhas
 
 
@@ -314,6 +352,7 @@ def main():
     p.add_argument("--ate", type=int, default=2024)
     p.add_argument("--trimestral", action="store_true", help="Também ingere ITR (trimestral).")
     p.add_argument("--dry-run", action="store_true", help="Processa mas não grava no banco.")
+    p.add_argument("--debug", action="store_true", help="Mostra diagnóstico detalhado de cada etapa do processamento.")
     args = p.parse_args()
 
     engine = create_engine(os.environ["DATABASE_URL"])
@@ -327,7 +366,7 @@ def main():
         print(f"--- {ano} ---")
         zf = baixar_zip(URL_DFP.format(ano=ano))
         if zf:
-            linhas = processar_ano(zf, ano, "dfp", "annual", mapa)
+            linhas = processar_ano(zf, ano, "dfp", "annual", mapa, debug=args.debug)
             print(f"  DFP: {len(linhas)} linhas", end="")
             if not args.dry_run:
                 gravar(engine, linhas)
@@ -339,7 +378,7 @@ def main():
         if args.trimestral:
             zfi = baixar_zip(URL_ITR.format(ano=ano))
             if zfi:
-                linhas = processar_ano(zfi, ano, "itr", "quarterly", mapa)
+                linhas = processar_ano(zfi, ano, "itr", "quarterly", mapa, debug=args.debug)
                 print(f"  ITR: {len(linhas)} linhas", end="")
                 if not args.dry_run:
                     gravar(engine, linhas)
