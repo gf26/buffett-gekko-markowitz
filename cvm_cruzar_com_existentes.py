@@ -79,18 +79,31 @@ def main():
             linha["ticker_existente"] = ticker
             linha["nome_yahoo"] = nome_yahoo
             linha["similaridade"] = round(sim, 2)
+            # mesmo similaridade alta erra: nomes "templados" por região/produto
+            # ("Equatorial Maranhão" vs "Equatorial Pará") batem 0.93 e são
+            # empresas DIFERENTES - por isso nenhuma faixa de similaridade é
+            # tratada como "segura para carregar sem olhar", exceto 1.0 exato
+            linha["confianca"] = "EXATO" if sim >= 0.999 else ("ALTA - AINDA ASSIM CONFIRME" if sim >= 0.90 else "BAIXA - REVISE COM CUIDADO")
             registro_antigo.append(linha)
         else:
             lacuna_real.append(linha)
 
-    df_antigo = pd.DataFrame(registro_antigo).sort_values("similaridade", ascending=False)
+    df_antigo = pd.DataFrame(registro_antigo)
+    ordem_confianca = {"EXATO": 0, "ALTA - AINDA ASSIM CONFIRME": 1, "BAIXA - REVISE COM CUIDADO": 2}
+    df_antigo["_ordem"] = df_antigo["confianca"].map(ordem_confianca)
+    df_antigo = df_antigo.sort_values(["_ordem", "similaridade"], ascending=[True, False]).drop(columns="_ordem")
     df_novo = pd.DataFrame(lacuna_real)
 
     df_antigo.to_csv(SAIDA_REGISTRO_ANTIGO, index=False, encoding="utf-8-sig")
     df_novo.to_csv(SAIDA_LACUNA_REAL, index=False, encoding="utf-8-sig")
 
     print(f"\n{len(df_antigo)} parecem ser registro antigo de ticker JÁ existente -> {SAIDA_REGISTRO_ANTIGO}")
-    print(f"  (revisão rápida: confirma o ticker sugerido e roda o carregamento em lote)")
+    if not df_antigo.empty:
+        for nivel, n in df_antigo["confianca"].value_counts().items():
+            print(f"  {nivel}: {n}")
+    print(f"  ATENÇÃO: só 'EXATO' é seguro para carregar em lote sem olhar. Os outros dois")
+    print(f"  níveis precisam de revisão linha a linha - nomes parecidos podem ser empresas")
+    print(f"  DIFERENTES (ex: mesma marca, subsidiária de outro estado).")
     print(f"{len(df_novo)} não bateram com nada existente -> {SAIDA_LACUNA_REAL}")
     print(f"  (candidatas reais a ticker novo - este é o grupo bem menor pra revisar com calma)")
 
