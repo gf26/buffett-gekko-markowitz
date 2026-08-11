@@ -1,0 +1,158 @@
+"""
+CVM - descoberta do plano de contas de INSTITUIÇÕES FINANCEIRAS.
+
+POR QUE ESTE SCRIPT EXISTE
+--------------------------
+Bancos, seguradoras e outras instituições financeiras usam um plano de contas
+DIFERENTE na CVM. A conta 2.03, que em uma indústria é "Patrimônio Líquido",
+significa outra coisa (ou nem existe) num banco. Por isso o de-para atual
+(cvm_ingestor.py) produz ~72% de concordância no setor financeiro, contra
+~93% no resto - e esses dados entrariam TORTOS, não é diferença de critério.
+
+Em vez de adivinhar os códigos a partir de documentação de terceiros, este
+script DESCOBRE a estrutura a partir dos próprios arquivos: pega as empresas
+que sabemos ser do setor financeiro, lista quais contas elas realmente usam,
+com as descrições oficiais (DS_CONTA), e mostra lado a lado com o que as
+empresas gerais usam.
+
+Foi essa mesma abordagem empírica que revelou, na Fase 1, que Patrimônio
+Líquido e Lucro Líquido precisavam da variante "controladores" - uma coisa
+que nenhuma documentação teria dito.
+
+SAÍDA
+-----
+Imprime no terminal e grava 'plano_contas_financeiro.csv' com:
+  - código da conta, descrição, quantas empresas financeiras usam
+  - se aquela conta também é usada por empresas gerais
+Com isso dá para montar o de-para específico com evidência, não com chute.
+
+Uso:
+    DATABASE_URL="..." python cvm_descobrir_plano_bancos.py --ano 2024
+"""
+import argparse
+import io
+import os
+import zipfile
+
+import pandas as pd
+import requests
+from sqlalchemy import create_engine, text
+
+URL_DFP = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/DFP/DADOS/dfp_cia_aberta_{ano}.zip"
+SETORES_FINANCEIROS = ("Financial Services", "Insurance")
+CSV_SAIDA = "plano_contas_financeiro.csv"
+
+# quantos níveis do código mostrar (2.03.09 = 3 níveis). Mais níveis = mais
+# detalhe e mais ruído; 2-3 costuma ser o suficiente para o de-para.
+NIVEL_MAX = 3
+
+
+def ler_demonstrativo(zf, ano, sigla):
+    nome = f"dfp_cia_aberta_{sigla}_con_{ano}.csv"
+    if nome not in zf.namelist():
+        return pd.DataFrame()
+    with zf.open(nome) as f:
+        df = pd.read_csv(f, sep=";", encoding="latin-1", decimal=".",
+                          dtype={"CD_CONTA": str, "CNPJ_CIA": str, "CD_CVM": str})
+    if "CD_CVM" in df.columns:
+        df["CD_CVM"] = df["CD_CVM"].str.strip().str.lstrip("0")
+    if "CD_CONTA" in df.columns:
+        df["CD_CONTA"] = df["CD_CONTA"].str.strip()
+    if "ORDEM_EXERC" in df.columns:
+        df = df[df["ORDEM_EXERC"] == "ÚLTIMO"]
+    return df
+
+
+def nivel_do_codigo(cd):
+    return len(str(cd).split("."))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--ano", type=int, default=2024)
+    p.add_argument("--nivel-max", type=int, default=NIVEL_MAX)
+    args = p.parse_args()
+
+    engine = create_engine(os.environ["DATABASE_URL"])
+
+    # quais CD_CVM são do setor financeiro (via nosso mapeamento + company_info)
+    with engine.connect() as conn:
+        df_setor = pd.read_sql(text("""
+            SELECT m.cd_cvm, m.ticker, ci.info->>'sector' AS setor
+            FROM ticker_cvm_map m
+            LEFT JOIN company_info ci ON ci.ticker = m.ticker
+        """), conn)
+
+    df_setor["cd_cvm"] = df_setor["cd_cvm"].astype(str).str.strip().str.lstrip("0")
+    financeiros = set(df_setor[df_setor["setor"].isin(SETORES_FINANCEIROS)]["cd_cvm"])
+    gerais = set(df_setor[~df_setor["setor"].isin(SETORES_FINANCEIROS)
+                           & df_setor["setor"].notna()]["cd_cvm"])
+
+    print(f"{len(financeiros)} empresas do setor financeiro mapeadas")
+    print(f"{len(gerais)} empresas de outros setores (grupo de comparação)")
+    if not financeiros:
+        raise SystemExit("Nenhuma empresa financeira mapeada - confira company_info e ticker_cvm_map.")
+
+    print(f"\nBaixando DFP {args.ano}...")
+    resp = requests.get(URL_DFP.format(ano=args.ano), timeout=300)
+    resp.raise_for_status()
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    print(f"  {len(resp.content)/1_000_000:.1f} MB")
+
+    linhas = []
+    for sigla in ["BPA", "BPP", "DRE", "DFC_MI"]:
+        df = ler_demonstrativo(zf, args.ano, sigla)
+        if df.empty:
+            continue
+        df = df[df["CD_CONTA"].apply(nivel_do_codigo) <= args.nivel_max]
+
+        fin = df[df["CD_CVM"].isin(financeiros)]
+        ger = df[df["CD_CVM"].isin(gerais)]
+
+        # para cada conta: quantas financeiras usam, quantas gerais usam
+        uso_fin = fin.groupby(["CD_CONTA", "DS_CONTA"])["CD_CVM"].nunique()
+        uso_ger = ger.groupby("CD_CONTA")["CD_CVM"].nunique()
+
+        for (cd, ds), n_fin in uso_fin.items():
+            n_ger = int(uso_ger.get(cd, 0))
+            linhas.append({
+                "demonstrativo": sigla, "cd_conta": cd, "descricao": ds,
+                "empresas_financeiras": int(n_fin),
+                "empresas_gerais": n_ger,
+                "pct_financeiras": round(100 * n_fin / len(financeiros), 1),
+                "exclusiva_do_setor_financeiro": "SIM" if n_ger == 0 else "não",
+            })
+
+    out = pd.DataFrame(linhas).sort_values(
+        ["demonstrativo", "cd_conta"]).reset_index(drop=True)
+    out.to_csv(CSV_SAIDA, index=False, encoding="utf-8-sig")
+
+    for sigla in ["BPA", "BPP", "DRE", "DFC_MI"]:
+        sub = out[out["demonstrativo"] == sigla]
+        if sub.empty:
+            continue
+        print("\n" + "=" * 78)
+        print(f"{sigla} - contas usadas por instituições financeiras")
+        print("=" * 78)
+        # só as usadas por uma fatia relevante do setor - o resto é cauda longa
+        relevantes = sub[sub["pct_financeiras"] >= 30]
+        print(relevantes[["cd_conta", "descricao", "pct_financeiras",
+                           "exclusiva_do_setor_financeiro"]].to_string(index=False))
+
+    print("\n" + "=" * 78)
+    print("CONTAS EXCLUSIVAS DO SETOR FINANCEIRO (não aparecem em empresas gerais)")
+    print("Estas são a evidência de que o plano de contas é mesmo diferente:")
+    print("=" * 78)
+    excl = out[(out["exclusiva_do_setor_financeiro"] == "SIM") & (out["pct_financeiras"] >= 30)]
+    if excl.empty:
+        print("  Nenhuma - o plano pode ser mais parecido do que se supunha.")
+    else:
+        print(excl[["demonstrativo", "cd_conta", "descricao", "pct_financeiras"]].to_string(index=False))
+
+    print(f"\nCSV completo em: {CSV_SAIDA}")
+    print("\nPRÓXIMO PASSO: com esta lista, monta-se o de-para específico do setor")
+    print("financeiro no cvm_ingestor.py, com evidência do que cada conta significa.")
+
+
+if __name__ == "__main__":
+    main()
