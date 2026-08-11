@@ -67,11 +67,64 @@ def nivel_do_codigo(cd):
     return len(str(cd).split("."))
 
 
+def dump_empresa(zf, ano, cd_cvm_alvo, nivel_max):
+    """Despeja o plano de contas COMPLETO de uma empresa específica.
+
+    A visão agregada esconde estrutura: contas usadas por poucas empresas
+    ficam abaixo do corte percentual e somem do relatório. Para entender o
+    plano de um banco, é preciso ver TODAS as contas que ELE declara."""
+    print("\n" + "=" * 78)
+    print(f"PLANO DE CONTAS COMPLETO - empresa CD_CVM {cd_cvm_alvo}")
+    print("=" * 78)
+
+    achou = False
+    for sigla in ["BPA", "BPP", "DRE", "DFC_MI"]:
+        df = ler_demonstrativo(zf, ano, sigla)
+        if df.empty:
+            continue
+        sub = df[df["CD_CVM"] == str(cd_cvm_alvo)]
+        if sub.empty:
+            continue
+        achou = True
+        nome = sub["DENOM_CIA"].iloc[0] if "DENOM_CIA" in sub.columns else "?"
+        sub = sub[sub["CD_CONTA"].apply(nivel_do_codigo) <= nivel_max]
+        sub = sub.sort_values("CD_CONTA")
+        print(f"\n--- {sigla} ({nome}) ---")
+        for _, r in sub.iterrows():
+            valor = r.get("VL_CONTA")
+            try:
+                valor_fmt = f"{float(valor):>20,.0f}"
+            except (TypeError, ValueError):
+                valor_fmt = f"{str(valor):>20}"
+            print(f"  {r['CD_CONTA']:<12} {str(r['DS_CONTA'])[:45]:<47} {valor_fmt}")
+
+    if not achou:
+        print(f"  Nenhum demonstrativo encontrado para CD_CVM {cd_cvm_alvo} em {ano}.")
+        print("  Confira o código (a coluna cd_cvm da tabela ticker_cvm_map).")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ano", type=int, default=2024)
     p.add_argument("--nivel-max", type=int, default=NIVEL_MAX)
+    p.add_argument("--min-pct", type=float, default=30.0,
+                    help="Só mostra contas usadas por pelo menos esta %% do setor. "
+                         "Baixe para 5 ou 10 para ver contas de subgrupos menores. Padrão: 30.")
+    p.add_argument("--dump", nargs="*", default=None,
+                    help="Despeja o plano de contas COMPLETO dos CD_CVM informados "
+                         "(ex: --dump 906 1023). Ignora a análise agregada.")
     args = p.parse_args()
+
+    # modo dump: não precisa de classificação setorial, vai direto ao arquivo
+    if args.dump:
+        print(f"Baixando DFP {args.ano}...")
+        resp = requests.get(URL_DFP.format(ano=args.ano), timeout=300)
+        resp.raise_for_status()
+        zf = zipfile.ZipFile(io.BytesIO(resp.content))
+        print(f"  {len(resp.content)/1_000_000:.1f} MB")
+        for cd in args.dump:
+            dump_empresa(zf, args.ano, str(cd).strip().lstrip("0"), args.nivel_max)
+        return
 
     engine = create_engine(os.environ["DATABASE_URL"])
 
@@ -135,7 +188,7 @@ def main():
         print(f"{sigla} - contas usadas por instituições financeiras")
         print("=" * 78)
         # só as usadas por uma fatia relevante do setor - o resto é cauda longa
-        relevantes = sub[sub["pct_financeiras"] >= 30]
+        relevantes = sub[sub["pct_financeiras"] >= args.min_pct]
         print(relevantes[["cd_conta", "descricao", "pct_financeiras",
                            "exclusiva_do_setor_financeiro"]].to_string(index=False))
 
@@ -143,7 +196,7 @@ def main():
     print("CONTAS EXCLUSIVAS DO SETOR FINANCEIRO (não aparecem em empresas gerais)")
     print("Estas são a evidência de que o plano de contas é mesmo diferente:")
     print("=" * 78)
-    excl = out[(out["exclusiva_do_setor_financeiro"] == "SIM") & (out["pct_financeiras"] >= 30)]
+    excl = out[(out["exclusiva_do_setor_financeiro"] == "SIM") & (out["pct_financeiras"] >= args.min_pct)]
     if excl.empty:
         print("  Nenhuma - o plano pode ser mais parecido do que se supunha.")
     else:
