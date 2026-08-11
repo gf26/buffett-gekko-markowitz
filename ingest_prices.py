@@ -58,20 +58,22 @@ def upsert_prices(cur, df, ticker):
         return 0
     df = df.reset_index()
     df["ticker"] = ticker
+    # open/high/low NÃO são coletados: as colunas foram removidas da tabela
+    # porque nenhum script do sistema as lia. O que é usado: adj_close
+    # (retornos), close e volume (liquidez / valor financeiro negociado).
     df = df.rename(columns={
-        "Date": "date", "Open": "open", "High": "high", "Low": "low",
+        "Date": "date",
         "Close": "close", "Adj Close": "adj_close", "Volume": "volume",
     })
-    df = df[["ticker", "date", "open", "high", "low", "close", "adj_close", "volume"]].dropna(subset=["date"])
+    df = df[["ticker", "date", "close", "adj_close", "volume"]].dropna(subset=["date"])
     df = df.where(pd.notnull(df), None)
     rows = list(df.itertuples(index=False, name=None))
     if not rows:
         return 0
     execute_values(cur, """
-        INSERT INTO prices_daily (ticker, date, open, high, low, close, adj_close, volume)
+        INSERT INTO prices_daily (ticker, date, close, adj_close, volume)
         VALUES %s
         ON CONFLICT (ticker, date) DO UPDATE SET
-            open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
             close = EXCLUDED.close, adj_close = EXCLUDED.adj_close, volume = EXCLUDED.volume
     """, rows, page_size=1000)
     return len(rows)
