@@ -149,22 +149,35 @@ def main_carregar(engine):
 
     with engine.begin() as conn:
         for _, r in revisadas.iterrows():
+            # vigente=FALSE: estes são registros HISTÓRICOS da empresa (ela
+            # mudou de CD_CVM depois). Com a chave composta (ticker, cd_cvm),
+            # eles SOMAM ao mapeamento atual em vez de substituí-lo - é o que
+            # permite o ingestor juntar o histórico pré e pós-reestruturação.
             conn.execute(text("""
-                INSERT INTO ticker_cvm_map (ticker, cd_cvm, nome_cvm, confianca)
-                VALUES (:ticker, :cd_cvm, :nome, :conf)
-                ON CONFLICT (ticker) DO UPDATE SET
-                    cd_cvm = EXCLUDED.cd_cvm, nome_cvm = EXCLUDED.nome_cvm,
+                INSERT INTO ticker_cvm_map (ticker, cd_cvm, nome_cvm, confianca, vigente)
+                VALUES (:ticker, :cd_cvm, :nome, :conf, FALSE)
+                ON CONFLICT (ticker, cd_cvm) DO UPDATE SET
+                    nome_cvm = EXCLUDED.nome_cvm,
                     confianca = EXCLUDED.confianca, updated_at = now()
             """), {
                 "ticker": r["ticker_final"], "cd_cvm": r["cd_cvm"],
                 "nome": r["nome"], "conf": "registro_antigo_confirmado",
             })
 
-    print(f"Carregadas {len(revisadas)} linhas em ticker_cvm_map.")
-    print("ATENÇÃO: ON CONFLICT (ticker) DO UPDATE sobrescreve o cd_cvm anterior desse")
-    print("ticker, não adiciona um segundo. Se um ticker precisar de MAIS de um cd_cvm")
-    print("histórico (ex: empresa com 2 reestruturações), me avisa - a tabela precisa")
-    print("virar uma lista (1 ticker -> N cd_cvm) em vez de 1-para-1 para suportar isso.")
+    print(f"Carregadas {len(revisadas)} linhas em ticker_cvm_map (como registros históricos).")
+
+    with engine.connect() as conn:
+        multi = conn.execute(text("""
+            SELECT ticker, COUNT(*) AS n FROM ticker_cvm_map
+            GROUP BY ticker HAVING COUNT(*) > 1 ORDER BY COUNT(*) DESC, ticker
+        """)).fetchall()
+    if multi:
+        print(f"\n{len(multi)} tickers agora têm mais de um registro CVM (histórico + vigente):")
+        for ticker, n in multi[:15]:
+            print(f"    {ticker}: {n} registros")
+        if len(multi) > 15:
+            print(f"    ... e mais {len(multi) - 15}")
+        print("\nRode o cvm_ingestor.py de novo para puxar o histórico desses registros antigos.")
 
 
 def parse_args():
