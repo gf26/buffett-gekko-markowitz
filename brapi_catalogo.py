@@ -24,8 +24,8 @@ CUSTO
 Uma requisição por subtipo. Com 8 subtipos, são 8 requisições de 15.000/mês.
 
 Uso:
-    BRAPI_TOKEN="nxdosUF2HxKTHChnCUHhwc" python brapi_catalogo.py
-    python brapi_catalogo.py --token nxdosUF2HxKTHChnCUHhwc --subtipos stock unit
+    BRAPI_TOKEN="seu_token" python brapi_catalogo.py
+    python brapi_catalogo.py --token SEU_TOKEN --subtipos stock unit
 """
 import argparse
 import json
