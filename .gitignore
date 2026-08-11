@@ -1,0 +1,3 @@
+dados_cvm/
+*.csv
+!tickers.csv
