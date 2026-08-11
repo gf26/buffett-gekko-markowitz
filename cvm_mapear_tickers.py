@@ -161,23 +161,28 @@ def carregar_csv(engine):
         raise SystemExit("Nenhum mapeamento preenchido no CSV.")
 
     with engine.begin() as conn:
+        # a tabela usa chave COMPOSTA (ticker, cd_cvm) - um ticker pode ter
+        # vários registros CVM ao longo da vida (reestruturações societárias).
+        # Ver schema_ticker_cvm_map_v2.sql.
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS ticker_cvm_map (
-                ticker      TEXT PRIMARY KEY REFERENCES tickers(ticker),
+                ticker      TEXT NOT NULL REFERENCES tickers(ticker),
                 cd_cvm      TEXT NOT NULL,
                 nome_cvm    TEXT,
                 confianca   TEXT,
-                updated_at  TIMESTAMPTZ DEFAULT now()
+                vigente     BOOLEAN DEFAULT TRUE,
+                updated_at  TIMESTAMPTZ DEFAULT now(),
+                PRIMARY KEY (ticker, cd_cvm)
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ticker_cvm_map_cd ON ticker_cvm_map(cd_cvm)"))
 
         for _, r in validos.iterrows():
             conn.execute(text("""
-                INSERT INTO ticker_cvm_map (ticker, cd_cvm, nome_cvm, confianca)
-                VALUES (:ticker, :cd_cvm, :nome, :conf)
-                ON CONFLICT (ticker) DO UPDATE SET
-                    cd_cvm = EXCLUDED.cd_cvm, nome_cvm = EXCLUDED.nome_cvm,
+                INSERT INTO ticker_cvm_map (ticker, cd_cvm, nome_cvm, confianca, vigente)
+                VALUES (:ticker, :cd_cvm, :nome, :conf, TRUE)
+                ON CONFLICT (ticker, cd_cvm) DO UPDATE SET
+                    nome_cvm = EXCLUDED.nome_cvm,
                     confianca = EXCLUDED.confianca, updated_at = now()
             """), {
                 "ticker": r["ticker"].strip(),
