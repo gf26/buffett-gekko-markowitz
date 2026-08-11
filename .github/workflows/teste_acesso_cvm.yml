@@ -1,0 +1,55 @@
+name: Teste de acesso à CVM
+
+# Teste diagnóstico: descobre se os runners do GitHub Actions conseguem
+# alcançar o servidor da CVM. O Codespace não consegue (timeout, provável
+# bloqueio por faixa de IP de datacenter), mas os runners do Actions ficam
+# em faixas diferentes - pode ser que passem.
+#
+# Se funcionar, a carga histórica da CVM pode virar um job automatizado,
+# em vez de depender de download manual pelo navegador.
+#
+# Rode manualmente: aba Actions > "Teste de acesso à CVM" > "Run workflow"
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  testar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Informação de rede do runner
+        run: |
+          echo "IP público deste runner:"
+          curl -s --max-time 15 https://api.ipify.org || echo "(não consegui descobrir)"
+          echo ""
+
+      - name: Teste 1 - controle (Google deve funcionar)
+        run: |
+          echo "== Google =="
+          curl -I --max-time 15 https://www.google.com 2>&1 | head -3 || true
+
+      - name: Teste 2 - CVM, arquivo pequeno (cadastro)
+        run: |
+          echo "== CVM: cad_cia_aberta.csv =="
+          if curl -I --max-time 60 https://dados.cvm.gov.br/dados/CIA_ABERTA/CAD/DADOS/cad_cia_aberta.csv 2>&1 | head -5; then
+            echo "-> respondeu"
+          else
+            echo "-> FALHOU"
+          fi
+
+      - name: Teste 3 - CVM, download de verdade (DFP 2024)
+        run: |
+          echo "== CVM: baixando dfp_cia_aberta_2024.zip =="
+          if curl -f -sS --max-time 300 -o /tmp/dfp2024.zip \
+              https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/DFP/DADOS/dfp_cia_aberta_2024.zip; then
+            TAMANHO=$(stat -c%s /tmp/dfp2024.zip)
+            echo "-> SUCESSO: $((TAMANHO / 1000000)) MB baixados"
+            echo ""
+            echo "CONCLUSÃO: os runners do Actions alcançam a CVM."
+            echo "A carga histórica pode ser automatizada aqui."
+          else
+            echo "-> FALHOU"
+            echo ""
+            echo "CONCLUSÃO: os runners também são bloqueados."
+            echo "Siga com o download manual pelo navegador + cache local (cvm_fonte.py)."
+          fi
