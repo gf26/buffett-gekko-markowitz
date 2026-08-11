@@ -105,6 +105,75 @@ DEMONSTRATIVOS = [
     ("DFC_MI", CONTAS_DFC, "cashflow"),
 ]
 
+# ---------------------------------------------------------------
+# DE-PARA ALTERNATIVO: instituições financeiras
+# ---------------------------------------------------------------
+# Bancos usam um plano de contas DIFERENTE na CVM, e o mesmo código significa
+# coisas opostas. Descoberto empiricamente (cvm_descobrir_plano_bancos.py),
+# comparando Bradesco (CD_CVM 906) com empresas do plano padrão:
+#
+#   código   plano padrão              plano de banco
+#   1.01     Ativo Circulante          Caixa e Equivalentes
+#   1.02     Ativo Não Circulante      Ativos Financeiros
+#   2.01     Passivo Circulante        Passivos Financeiros a Valor Justo
+#   2.03     PATRIMÔNIO LÍQUIDO        PROVISÕES              <- o mais perigoso
+#   2.07     (não existe)              Patrimônio Líquido
+#   3.05     EBIT                      Resultado antes dos Tributos
+#   3.06     Resultado Financeiro      Imposto de Renda
+#
+# Sem esta separação, o PL do Bradesco entraria como R$ 402 bi (as provisões)
+# em vez dos R$ 168 bi reais - erro de 140% com número plausível.
+CONTAS_BPA_BANCO = {
+    "1": "Total Assets",
+    "1.01": "Cash And Cash Equivalents",
+    "1.06": "Net PPE",
+    "1.07": "Goodwill And Other Intangible Assets",
+    # Bancos NÃO classificam ativo por liquidez - não existe "Ativo
+    # Circulante". Deixar Current Assets ausente é correto: melhor NULL do
+    # que um número que não significa o que o nome diz.
+}
+CONTAS_BPP_BANCO = {
+    "2.07": "Total Equity Gross Minority Interest",
+    "2.07.01": "Stockholders Equity",   # já vem pronto, não precisa subtrair
+    "2.07.02": "Minority Interest",
+}
+CONTAS_DRE_BANCO = {
+    "3.01": "Total Revenue",            # Receitas de Intermediação Financeira
+    "3.02": "Cost Of Revenue",          # Despesas de Intermediação Financeira
+    "3.03": "Gross Profit",             # Resultado Bruto de Intermediação
+    "3.04": "Operating Expense",
+    "3.05": "Pretax Income",            # atenção: NÃO é EBIT como no padrão
+    "3.06": "Tax Provision",
+    "3.11": "Net Income Including Noncontrolling Interests",
+    "3.11.01": "Net Income",
+}
+# O fluxo de caixa é idêntico nos dois planos (6.01/6.02/6.03).
+CONTAS_DFC_BANCO = dict(CONTAS_DFC)
+
+DEMONSTRATIVOS_BANCO = [
+    ("BPA", CONTAS_BPA_BANCO, "balance_sheet"),
+    ("BPP", CONTAS_BPP_BANCO, "balance_sheet"),
+    ("DRE", CONTAS_DRE_BANCO, "income_statement"),
+    ("DFC_MI", CONTAS_DFC_BANCO, "cashflow"),
+]
+
+
+def detectar_empresas_plano_banco(zf, ano, prefixo):
+    """Quais CD_CVM usam o plano de contas de instituição financeira.
+
+    A detecção é ESTRUTURAL, não por setor: procura quem declara a conta 2.07
+    descrita como Patrimônio Líquido. Usar o setor do Yahoo seria frágil - a
+    B3 (bolsa) é classificada como 'Financial Services' mas usa o plano
+    PADRÃO, e aplicar o plano de banco nela geraria dados errados."""
+    df = ler_csv(zf, f"{prefixo}_cia_aberta_BPP_con_{ano}.csv")
+    if df.empty or "DS_CONTA" not in df.columns:
+        return set()
+    marca = df[
+        (df["CD_CONTA"].str.strip() == "2.07")
+        & (df["DS_CONTA"].astype(str).str.contains("Patrim", case=False, na=False))
+    ]
+    return set(marca["CD_CVM"].astype(str).str.strip())
+
 # CapEx: sem código fixo na CVM, procuramos por descrição em subcontas de 6.02
 PADRAO_CAPEX = re.compile(
     r"(?:aquisi\w*|compra\w*|adi\w*)\s+.*(?:imobilizado|ativo\s+imobilizado|intang)", re.IGNORECASE
@@ -210,33 +279,37 @@ def acoes_em_circulacao(zf, ano, prefixo):
 def processar_ano(zf, ano, prefixo, period_type, mapa_ticker, debug=False):
     """Devolve as linhas prontas para inserir em `financials`."""
     pubs = datas_publicacao(zf, ano, prefixo)
+    bancos = detectar_empresas_plano_banco(zf, ano, prefixo)
+    if debug or bancos:
+        print(f"    {len(bancos)} empresas usam o plano de contas de instituição financeira")
     frames = []
 
-    for sigla, contas, statement in DEMONSTRATIVOS:
-        nome_arq = f"{prefixo}_cia_aberta_{sigla}_con_{ano}.csv"
-        bruto = ler_csv(zf, nome_arq)
-        if debug:
-            print(f"    [{sigla}] arquivo={nome_arq!r} existe_no_zip={nome_arq in zf.namelist()} linhas_brutas={len(bruto)}")
-        df = preparar(bruto)
-        if df.empty:
+    for grupo, demonstrativos in [("padrão", DEMONSTRATIVOS), ("banco", DEMONSTRATIVOS_BANCO)]:
+        for sigla, contas, statement in demonstrativos:
+            nome_arq = f"{prefixo}_cia_aberta_{sigla}_con_{ano}.csv"
+            bruto = ler_csv(zf, nome_arq)
+            if debug and grupo == "padrão":
+                print(f"    [{sigla}] arquivo={nome_arq!r} existe_no_zip={nome_arq in zf.namelist()} linhas_brutas={len(bruto)}")
+            df = preparar(bruto)
+            if df.empty:
+                continue
+
+            # cada empresa é processada APENAS com o plano que ela de fato usa
+            if grupo == "banco":
+                df = df[df["CD_CVM"].astype(str).str.strip().isin(bancos)]
+            else:
+                df = df[~df["CD_CVM"].astype(str).str.strip().isin(bancos)]
+            if df.empty:
+                continue
+
+            df = df[df["CD_CONTA"].isin(contas)].copy()
+            if df.empty:
+                continue
+            df["line_item"] = df["CD_CONTA"].map(contas)
+            df["statement"] = statement
+            frames.append(df[["CD_CVM", "DT_REFER", "DT_FIM_EXERC", "statement", "line_item", "VL_CONTA"]])
             if debug:
-                print(f"    [{sigla}] vazio após preparar() - pulando")
-            continue
-        if debug:
-            contas_no_arquivo = set(df["CD_CONTA"].unique())
-            contas_esperadas = set(contas.keys())
-            print(f"    [{sigla}] contas esperadas: {sorted(contas_esperadas)}")
-            print(f"    [{sigla}] intersecção com o arquivo: {sorted(contas_esperadas & contas_no_arquivo)}")
-        df = df[df["CD_CONTA"].isin(contas)].copy()
-        if df.empty:
-            if debug:
-                print(f"    [{sigla}] nenhuma conta do de-para encontrada neste arquivo - pulando")
-            continue
-        df["line_item"] = df["CD_CONTA"].map(contas)
-        df["statement"] = statement
-        frames.append(df[["CD_CVM", "DT_REFER", "DT_FIM_EXERC", "statement", "line_item", "VL_CONTA"]])
-        if debug:
-            print(f"    [{sigla}] {len(df)} linhas aproveitadas")
+                print(f"    [{sigla}/{grupo}] {len(df)} linhas aproveitadas")
 
     if not frames:
         if debug:
@@ -247,19 +320,30 @@ def processar_ano(zf, ano, prefixo, period_type, mapa_ticker, debug=False):
     if debug:
         print(f"    total após concat: {len(dados)} linhas, {dados['CD_CVM'].nunique()} empresas")
 
-    # Patrimônio Líquido dos controladores = total - minoritários
+    # Patrimônio Líquido dos controladores = total - minoritários.
+    # Só para o plano PADRÃO: bancos já declaram esse valor pronto na conta
+    # 2.07.01, então derivar de novo sobrescreveria o dado correto por um
+    # cálculo redundante (e potencialmente diferente por arredondamento).
     piv = dados[dados["statement"] == "balance_sheet"].pivot_table(
         index=["CD_CVM", "DT_REFER", "DT_FIM_EXERC"], columns="line_item",
         values="VL_CONTA", aggfunc="first").reset_index()
     if "Total Equity Gross Minority Interest" in piv.columns:
+        ja_tem = (piv["Stockholders Equity"].notna()
+                  if "Stockholders Equity" in piv.columns
+                  else pd.Series(False, index=piv.index))
         minor = piv["Minority Interest"] if "Minority Interest" in piv.columns else 0
-        piv["Stockholders Equity"] = (piv["Total Equity Gross Minority Interest"]
-                                       - pd.to_numeric(minor, errors="coerce").fillna(0))
-        extra = piv[["CD_CVM", "DT_REFER", "DT_FIM_EXERC", "Stockholders Equity"]].copy()
-        extra = extra.rename(columns={"Stockholders Equity": "VL_CONTA"})
+        derivado = (piv["Total Equity Gross Minority Interest"]
+                    - pd.to_numeric(minor, errors="coerce").fillna(0))
+        extra = piv.loc[~ja_tem, ["CD_CVM", "DT_REFER", "DT_FIM_EXERC"]].copy()
+        extra["VL_CONTA"] = derivado[~ja_tem]
         extra["line_item"] = "Stockholders Equity"
         extra["statement"] = "balance_sheet"
-        dados = pd.concat([dados, extra], ignore_index=True)
+        extra = extra.dropna(subset=["VL_CONTA"])
+        if not extra.empty:
+            dados = pd.concat([dados, extra], ignore_index=True)
+        if debug:
+            print(f"    Stockholders Equity: {int(ja_tem.sum())} vieram prontos (bancos), "
+                  f"{len(extra)} derivados (plano padrão)")
 
     # Passivo total = circulante + não circulante
     if {"Current Liabilities", "Total Non Current Liabilities Net Minority Interest"} <= set(piv.columns):
