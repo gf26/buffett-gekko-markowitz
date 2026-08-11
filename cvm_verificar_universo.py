@@ -30,6 +30,8 @@ import pandas as pd
 import requests
 from sqlalchemy import create_engine, text
 
+import cvm_fonte
+
 URL_CADASTRO = "https://dados.cvm.gov.br/dados/CIA_ABERTA/CAD/DADOS/cad_cia_aberta.csv"
 CSV_SAIDA = "empresas_cvm_nao_mapeadas.csv"
 
@@ -55,17 +57,17 @@ def achar_coluna(df, chave):
 
 
 def baixar_cadastro():
-    print(f"Baixando {URL_CADASTRO} ...")
-    resp = requests.get(URL_CADASTRO, timeout=120)
-    resp.raise_for_status()
+    # usa o cache local (dados_cvm/) quando disponível - o servidor da CVM
+    # às vezes bloqueia conexões vindas do Codespace por faixa de IP
+    conteudo = cvm_fonte.obter_cadastro()
     # encoding e separador seguem o mesmo padrão dos outros arquivos da CVM,
     # mas com fallback caso este arquivo específico use vírgula
     try:
-        df = pd.read_csv(io.BytesIO(resp.content), sep=";", encoding="latin-1", dtype=str)
+        df = pd.read_csv(io.BytesIO(conteudo), sep=";", encoding="latin-1", dtype=str)
         if df.shape[1] <= 1:
             raise ValueError("só 1 coluna - separador provavelmente errado")
     except Exception:
-        df = pd.read_csv(io.BytesIO(resp.content), sep=",", encoding="latin-1", dtype=str)
+        df = pd.read_csv(io.BytesIO(conteudo), sep=",", encoding="latin-1", dtype=str)
     print(f"  {len(df)} linhas, {len(df.columns)} colunas")
     return df
 
