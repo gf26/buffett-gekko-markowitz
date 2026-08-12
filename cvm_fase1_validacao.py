@@ -49,6 +49,8 @@ import pandas as pd
 import requests
 from sqlalchemy import create_engine, text
 
+import cvm_fonte
+
 CVM_DFP_URL = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/DFP/DADOS/dfp_cia_aberta_{ano}.zip"
 
 # Contas CVM que vamos comparar com o Yahoo nesta prova de conceito.
@@ -90,12 +92,12 @@ ESCALA = {"UNIDADE": 1, "MIL": 1_000, "MILHAR": 1_000, "MILHÃO": 1_000_000, "MI
 
 
 def baixar_dfp(ano):
-    url = CVM_DFP_URL.format(ano=ano)
-    print(f"Baixando {url} ...")
-    resp = requests.get(url, timeout=180)
-    resp.raise_for_status()
-    print(f"  {len(resp.content) / 1_000_000:.1f} MB baixados")
-    return zipfile.ZipFile(io.BytesIO(resp.content))
+    """Lê do cache local (dados_cvm/) - o servidor da CVM bloqueia conexões
+    vindas do Codespace. Ver ATUALIZACAO_MANUAL_CVM.md"""
+    zf = cvm_fonte.obter_dfp(ano)
+    if zf is None:
+        raise SystemExit(f"DFP {ano} não disponível. Veja: python cvm_fonte.py --listar")
+    return zf
 
 
 def ler_demonstrativo(zf, ano, sigla, consolidado=True):
