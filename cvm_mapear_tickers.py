@@ -44,6 +44,8 @@ import pandas as pd
 import requests
 from sqlalchemy import create_engine, text
 
+import cvm_fonte
+
 CVM_DFP_URL = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/DFP/DADOS/dfp_cia_aberta_{ano}.zip"
 CSV_MAPEAMENTO = "mapeamento_tickers_cvm.csv"
 N_SUGESTOES = 3
@@ -63,11 +65,10 @@ def normalizar_nome(nome):
 
 def baixar_empresas_cvm(ano):
     """Lista de empresas que entregaram DFP no ano (CNPJ, nome, código CVM)."""
-    url = CVM_DFP_URL.format(ano=ano)
-    print(f"Baixando {url} ...")
-    resp = requests.get(url, timeout=180)
-    resp.raise_for_status()
-    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    # lê do cache local (dados_cvm/) - a CVM bloqueia o Codespace
+    zf = cvm_fonte.obter_dfp(ano)
+    if zf is None:
+        raise SystemExit(f"DFP {ano} não disponível. Veja: python cvm_fonte.py --listar")
 
     nome_arq = f"dfp_cia_aberta_{ano}.csv"
     with zf.open(nome_arq) as f:
