@@ -1,3 +1,7 @@
 dados_cvm/
 *.csv
 !tickers.csv
+*.png
+__pycache__/
+*.pyc
+brapi_catalogo.json
