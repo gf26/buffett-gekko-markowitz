@@ -75,8 +75,6 @@ CONTAS_BPP = {
     "2.01.04": "Current Debt",
     "2.02": "Total Non Current Liabilities Net Minority Interest",
     "2.02.01": "Long Term Debt",
-    "2.03": "Total Equity Gross Minority Interest",
-    "2.03.09": "Minority Interest",
 }
 # Demonstração do Resultado
 CONTAS_DRE = {
@@ -88,8 +86,6 @@ CONTAS_DRE = {
     "3.06": "Net Non Operating Interest Income Expense",
     "3.07": "Pretax Income",
     "3.08": "Tax Provision",
-    "3.11": "Net Income Including Noncontrolling Interests",
-    "3.11.01": "Net Income",  # atribuível aos controladores - variante vencedora na Fase 1
 }
 # Fluxo de Caixa (método indireto)
 CONTAS_DFC = {
@@ -133,9 +129,6 @@ CONTAS_BPA_BANCO = {
     # que um número que não significa o que o nome diz.
 }
 CONTAS_BPP_BANCO = {
-    "2.07": "Total Equity Gross Minority Interest",
-    "2.07.01": "Stockholders Equity",   # já vem pronto, não precisa subtrair
-    "2.07.02": "Minority Interest",
 }
 CONTAS_DRE_BANCO = {
     "3.01": "Total Revenue",            # Receitas de Intermediação Financeira
@@ -144,8 +137,6 @@ CONTAS_DRE_BANCO = {
     "3.04": "Operating Expense",
     "3.05": "Pretax Income",            # atenção: NÃO é EBIT como no padrão
     "3.06": "Tax Provision",
-    "3.11": "Net Income Including Noncontrolling Interests",
-    "3.11.01": "Net Income",
 }
 # O fluxo de caixa é idêntico nos dois planos (6.01/6.02/6.03).
 CONTAS_DFC_BANCO = dict(CONTAS_DFC)
@@ -161,20 +152,42 @@ DEMONSTRATIVOS_BANCO = [
 def detectar_empresas_plano_banco(zf, ano, prefixo):
     """Quais CD_CVM usam o plano de contas de instituição financeira.
 
-    A detecção é ESTRUTURAL, não por setor: procura quem declara a conta 2.07
-    descrita como Patrimônio Líquido. Usar o setor do Yahoo seria frágil - a
-    B3 (bolsa) é classificada como 'Financial Services' mas usa o plano
-    PADRÃO, e aplicar o plano de banco nela geraria dados errados."""
-    df = ler_csv(zf, f"{prefixo}_cia_aberta_BPP_con_{ano}.csv")
-    if df.empty or "DS_CONTA" not in df.columns:
+    Detecta pela AUSÊNCIA de "Ativo Circulante" no BPA. Instituições
+    financeiras não classificam o balanço por liquidez (circulante x não
+    circulante) - essa é a assinatura estrutural do plano delas.
+
+    A versão anterior procurava a conta 2.07 descrita como Patrimônio
+    Líquido. Isso falhava para BTG, Itaú, BMG e Pine, que declaram o
+    patrimônio em 2.08 (existem DUAS variantes do plano de banco). Como
+    consequência, esses quatro caíam no plano padrão e liam contas erradas -
+    o patrimônio do Itaú aparecia como R$ 2,1 trilhões em vez de R$ 211 bi.
+
+    Detectar pela ausência de Ativo Circulante pega as duas variantes, e
+    qualquer outra que apareça.
+
+    Não usar o setor do Yahoo: a B3 (bolsa) é 'Financial Services' lá, mas
+    usa o plano PADRÃO - aplicar o de banco nela geraria dados errados."""
+    bpa = ler_csv(zf, f"{prefixo}_cia_aberta_BPA_con_{ano}.csv")
+    if bpa.empty or "DS_CONTA" not in bpa.columns:
         return set()
-    marca = df[
-        (df["CD_CONTA"].str.strip() == "2.07")
-        & (df["DS_CONTA"].astype(str).str.contains("Patrim", case=False, na=False))
-    ]
-    return set(marca["CD_CVM"].astype(str).str.strip())
+    bpa = bpa[bpa["ORDEM_EXERC"] == "ÚLTIMO"] if "ORDEM_EXERC" in bpa.columns else bpa
+
+    todas = set(bpa["CD_CVM"].astype(str).str.strip())
+    com_circulante = set(bpa[
+        (bpa["CD_CONTA"].str.strip() == "1.01")
+        & (bpa["DS_CONTA"].astype(str).str.contains(r"ativo\s+circulante", case=False, na=False, regex=True))
+    ]["CD_CVM"].astype(str).str.strip())
+    return todas - com_circulante
 
 # CapEx: sem código fixo na CVM, procuramos por descrição em subcontas de 6.02
+# Localização por DESCRIÇÃO (ver _localizar_por_descricao). O mesmo conceito
+# fica em códigos diferentes conforme o plano de contas da empresa.
+RE_PL_TOTAL = re.compile(r"patrim[oô]nio\s+l[ií]quido\s+consolidado", re.IGNORECASE)
+RE_LUCRO = re.compile(r"(lucro|preju[ií]zo).*consolidad", re.IGNORECASE)
+RE_POR_ACAO = re.compile(r"por\s+a[cç][aã]o", re.IGNORECASE)
+RE_NAO_CONTROLADOR = re.compile(r"n[aã]o\s+controlador", re.IGNORECASE)
+RE_CONTROLADOR = re.compile(r"controlador", re.IGNORECASE)
+
 PADRAO_CAPEX = re.compile(
     r"(?:aquisi\w*|compra\w*|adi\w*)\s+.*(?:imobilizado|ativo\s+imobilizado|intang)", re.IGNORECASE
 )
@@ -276,6 +289,73 @@ def acoes_em_circulacao(zf, ano, prefixo):
     return agg
 
 
+def _localizar_por_descricao(g, re_pai, re_excluir=None):
+    """Localiza um conceito pela DESCRIÇÃO da conta, não pelo código.
+
+    POR QUE: o mesmo conceito fica em códigos diferentes conforme o plano.
+    Patrimônio Líquido aparece em 2.03 (padrão), 2.07 (banco variante A) ou
+    2.08 (banco variante B); Lucro Líquido em 3.09, 3.11 ou 3.13. Fixar
+    códigos exigiria enumerar todas as variantes - e uma nova quebraria
+    silenciosamente. A descrição, essa, a CVM mantém padronizada.
+
+    Devolve (valor_dos_controladores, codigo_raiz, como_obtido)."""
+    cand = g[g["DS_CONTA"].str.contains(re_pai, na=False)]
+    if re_excluir is not None and not cand.empty:
+        cand = cand[~cand["DS_CONTA"].str.contains(re_excluir, na=False)]
+    if cand.empty:
+        return None, None, "não encontrado"
+
+    # a raiz é a de menor profundidade (2.03 antes de 2.03.01)
+    pai = cand.loc[cand["CD_CONTA"].str.count(r"\.").idxmin()]
+    raiz, total = pai["CD_CONTA"], pai["VL_CONTA"]
+
+    # SÓ filhas diretas: uma conta neta cuja descrição menciona "controlador"
+    # (ex: 2.03.02.09 "Opções Outorgadas a Não Controladores") seria escolhida
+    # por engano, quebrando empresas hoje corretas (TOTS3, EMBJ3, PASS3).
+    filhas = g[g["CD_CONTA"].str.startswith(raiz + ".")
+               & (g["CD_CONTA"].str.count(r"\.") == raiz.count(".") + 1)]
+
+    # 1ª opção: filha que já traz o valor dos controladores pronto
+    contr = filhas[filhas["DS_CONTA"].str.contains(RE_CONTROLADOR, na=False)
+                   & ~filhas["DS_CONTA"].str.contains(RE_NAO_CONTROLADOR, na=False)]
+    if not contr.empty:
+        return float(contr.iloc[0]["VL_CONTA"]), raiz, f"direto:{contr.iloc[0]['CD_CONTA']}"
+
+    # 2ª opção: total menos a participação dos não controladores
+    nao = filhas[filhas["DS_CONTA"].str.contains(RE_NAO_CONTROLADOR, na=False)]
+    minor = float(nao.iloc[0]["VL_CONTA"]) if not nao.empty else 0.0
+    return float(total) - minor, raiz, f"{raiz}-minoritarios"
+
+
+def extrair_pl_e_lucro(zf, ano, prefixo):
+    """Patrimônio Líquido e Lucro Líquido (atribuíveis aos controladores),
+    localizados por descrição - funciona em qualquer variante de plano."""
+    linhas = []
+    for sigla, statement, re_pai, re_excl, nome_total, nome_contr in [
+        ("BPP", "balance_sheet", RE_PL_TOTAL, None,
+         "Total Equity Gross Minority Interest", "Stockholders Equity"),
+        ("DRE", "income_statement", RE_LUCRO, RE_POR_ACAO,
+         "Net Income Including Noncontrolling Interests", "Net Income"),
+    ]:
+        df = preparar(ler_csv(zf, f"{prefixo}_cia_aberta_{sigla}_con_{ano}.csv"))
+        if df.empty or "DS_CONTA" not in df.columns:
+            continue
+        df["DS_CONTA"] = df["DS_CONTA"].astype(str)
+        for (cd, dt_ref, dt_fim), g in df.groupby(["CD_CVM", "DT_REFER", "DT_FIM_EXERC"]):
+            valor, raiz, _ = _localizar_por_descricao(g, re_pai, re_excl)
+            if valor is None:
+                continue
+            total = g[g["CD_CONTA"] == raiz]["VL_CONTA"]
+            if not total.empty and pd.notna(total.iloc[0]):
+                linhas.append({"CD_CVM": cd, "DT_REFER": dt_ref, "DT_FIM_EXERC": dt_fim,
+                               "statement": statement, "line_item": nome_total,
+                               "VL_CONTA": float(total.iloc[0])})
+            linhas.append({"CD_CVM": cd, "DT_REFER": dt_ref, "DT_FIM_EXERC": dt_fim,
+                           "statement": statement, "line_item": nome_contr,
+                           "VL_CONTA": valor})
+    return pd.DataFrame(linhas)
+
+
 def processar_ano(zf, ano, prefixo, period_type, mapa_ticker, debug=False):
     """Devolve as linhas prontas para inserir em `financials`."""
     pubs = datas_publicacao(zf, ano, prefixo)
@@ -320,40 +400,60 @@ def processar_ano(zf, ano, prefixo, period_type, mapa_ticker, debug=False):
     if debug:
         print(f"    total após concat: {len(dados)} linhas, {dados['CD_CVM'].nunique()} empresas")
 
-    # Patrimônio Líquido dos controladores = total - minoritários.
-    # Só para o plano PADRÃO: bancos já declaram esse valor pronto na conta
-    # 2.07.01, então derivar de novo sobrescreveria o dado correto por um
-    # cálculo redundante (e potencialmente diferente por arredondamento).
+    # Patrimônio Líquido e Lucro Líquido vêm por DESCRIÇÃO, não por código -
+    # o mesmo conceito fica em 2.03/2.07/2.08 e 3.09/3.11/3.13 conforme o
+    # plano de contas da empresa. Ver _localizar_por_descricao.
+    pl_lucro = extrair_pl_e_lucro(zf, ano, prefixo)
+    if not pl_lucro.empty:
+        dados = pd.concat([dados, pl_lucro], ignore_index=True)
+        if debug:
+            n_pl = (pl_lucro["line_item"] == "Stockholders Equity").sum()
+            n_li = (pl_lucro["line_item"] == "Net Income").sum()
+            print(f"    por descrição: {n_pl} patrimônios, {n_li} lucros líquidos")
+
     piv = dados[dados["statement"] == "balance_sheet"].pivot_table(
         index=["CD_CVM", "DT_REFER", "DT_FIM_EXERC"], columns="line_item",
         values="VL_CONTA", aggfunc="first").reset_index()
-    if "Total Equity Gross Minority Interest" in piv.columns:
-        ja_tem = (piv["Stockholders Equity"].notna()
-                  if "Stockholders Equity" in piv.columns
-                  else pd.Series(False, index=piv.index))
-        minor = piv["Minority Interest"] if "Minority Interest" in piv.columns else 0
-        derivado = (piv["Total Equity Gross Minority Interest"]
-                    - pd.to_numeric(minor, errors="coerce").fillna(0))
-        extra = piv.loc[~ja_tem, ["CD_CVM", "DT_REFER", "DT_FIM_EXERC"]].copy()
-        extra["VL_CONTA"] = derivado[~ja_tem]
-        extra["line_item"] = "Stockholders Equity"
-        extra["statement"] = "balance_sheet"
-        extra = extra.dropna(subset=["VL_CONTA"])
-        if not extra.empty:
-            dados = pd.concat([dados, extra], ignore_index=True)
-        if debug:
-            print(f"    Stockholders Equity: {int(ja_tem.sum())} vieram prontos (bancos), "
-                  f"{len(extra)} derivados (plano padrão)")
 
-    # Passivo total = circulante + não circulante
+    # Passivo total.
+    # Plano PADRÃO: circulante + não circulante.
+    # Plano de BANCO: essas contas não existem (bancos não classificam o
+    # balanço por liquidez), então usamos a identidade contábil
+    # Passivo = Ativo - Patrimônio Líquido.
+    #
+    # O código anterior somava as duas com .fillna(0) e, para bancos - onde
+    # AMBAS faltam - gravava ZERO. O passivo do Banco do Brasil aparecia como
+    # R$ 0 em vez de ~R$ 2,2 trilhões, o que quebraria qualquer indicador de
+    # alavancagem (Debt/Equity, por exemplo).
     if {"Current Liabilities", "Total Non Current Liabilities Net Minority Interest"} <= set(piv.columns):
+        cl = pd.to_numeric(piv["Current Liabilities"], errors="coerce")
+        ncl = pd.to_numeric(piv["Total Non Current Liabilities Net Minority Interest"], errors="coerce")
+        # só soma onde PELO MENOS UMA existe - se as duas faltam, o resultado
+        # é NaN (desconhecido), não zero
+        soma = cl.fillna(0) + ncl.fillna(0)
+        soma = soma.where(cl.notna() | ncl.notna())
+    else:
+        soma = pd.Series(pd.NA, index=piv.index, dtype="float64")
+
+    if {"Total Assets", "Stockholders Equity"} <= set(piv.columns):
+        ta = pd.to_numeric(piv["Total Assets"], errors="coerce")
+        se = pd.to_numeric(piv["Stockholders Equity"], errors="coerce")
+        por_identidade = ta - se
+    else:
+        por_identidade = pd.Series(pd.NA, index=piv.index, dtype="float64")
+
+    passivo = soma.fillna(por_identidade)
+    if passivo.notna().any():
         tot = piv[["CD_CVM", "DT_REFER", "DT_FIM_EXERC"]].copy()
-        tot["VL_CONTA"] = (pd.to_numeric(piv["Current Liabilities"], errors="coerce").fillna(0)
-                            + pd.to_numeric(piv["Total Non Current Liabilities Net Minority Interest"],
-                                            errors="coerce").fillna(0))
+        tot["VL_CONTA"] = passivo
         tot["line_item"] = "Total Liabilities Net Minority Interest"
         tot["statement"] = "balance_sheet"
-        dados = pd.concat([dados, tot], ignore_index=True)
+        tot = tot.dropna(subset=["VL_CONTA"])
+        if not tot.empty:
+            dados = pd.concat([dados, tot], ignore_index=True)
+        if debug:
+            print(f"    Passivo total: {int(soma.notna().sum())} por soma, "
+                  f"{int((soma.isna() & por_identidade.notna()).sum())} por identidade contábil")
 
     # CapEx e número de ações (fontes auxiliares)
     capex = extrair_capex(zf, ano, prefixo)
@@ -370,6 +470,22 @@ def processar_ano(zf, ano, prefixo, period_type, mapa_ticker, debug=False):
                                           "statement", "line_item", "VL_CONTA"]]], ignore_index=True)
 
     dados = dados.dropna(subset=["VL_CONTA"])
+
+    # Descarta empresa/exercício em que TODOS os valores são zero. Uma empresa
+    # com ativo, patrimônio, receita e lucro todos exatamente 0 não é uma
+    # empresa sem valor - é um documento entregue sem dados (empresa em
+    # liquidação, ou entrega apenas formal). Gravar zeros seria pior que não
+    # gravar: eles entrariam nos cálculos como se fossem informação real,
+    # distorcendo percentis e rankings.
+    if not dados.empty:
+        chave = ["CD_CVM", "DT_FIM_EXERC"]
+        tem_valor = dados.groupby(chave)["VL_CONTA"].transform(lambda s: (s != 0).any())
+        n_descartados = int((~tem_valor).sum())
+        if n_descartados:
+            empresas_zeradas = dados.loc[~tem_valor, "CD_CVM"].nunique()
+            print(f"    descartando {n_descartados} linhas de {empresas_zeradas} empresa(s) "
+                  f"com TODOS os valores zerados (documento sem dados)")
+        dados = dados[tem_valor]
     if debug:
         print(f"    após dropna(VL_CONTA): {len(dados)} linhas")
     dados["fiscal_date"] = pd.to_datetime(dados["DT_FIM_EXERC"], errors="coerce").dt.date
