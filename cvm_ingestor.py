@@ -42,7 +42,21 @@ import argparse
 import os
 import re
 
+import warnings
+
 import pandas as pd
+
+# Os CSVs da CVM têm colunas de tipo misto e são lidos em fatias, o que gera
+# DtypeWarning/SettingWithCopyWarning a cada arquivo. São previsíveis e já
+# tratados (dtype explícito em CD_CONTA/CD_CVM, .copy() antes de atribuir) -
+# silenciar aqui evita que centenas de avisos escondam a saída útil.
+# filtra por MENSAGEM em vez de por classe: SettingWithCopyWarning existe em
+# pandas 2.x mas foi removida em 3.x - referenciar a classe quebraria o import
+# dependendo da versão instalada.
+warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
+warnings.filterwarnings("ignore", message=".*value is trying to be set on a copy.*")
+warnings.filterwarnings("ignore", message=".*only bool and object.*")
+warnings.filterwarnings("ignore", message=".*invalid value encountered.*")
 from sqlalchemy import create_engine, text
 from psycopg2.extras import execute_values
 
@@ -357,8 +371,6 @@ def processar_ano(zf, ano, prefixo, period_type, mapa_ticker, debug=False):
         for sigla, contas, statement in demonstrativos:
             nome_arq = f"{prefixo}_cia_aberta_{sigla}_con_{ano}.csv"
             bruto = ler_csv(zf, nome_arq)
-            if debug and grupo == "padrão":
-                print(f"    [{sigla}] arquivo={nome_arq!r} existe_no_zip={nome_arq in zf.namelist()} linhas_brutas={len(bruto)}")
             df = preparar(bruto)
             if df.empty:
                 continue
@@ -377,8 +389,6 @@ def processar_ano(zf, ano, prefixo, period_type, mapa_ticker, debug=False):
             df["line_item"] = df["CD_CONTA"].map(contas)
             df["statement"] = statement
             frames.append(df[["CD_CVM", "DT_REFER", "DT_FIM_EXERC", "statement", "line_item", "VL_CONTA"]])
-            if debug:
-                print(f"    [{sigla}/{grupo}] {len(df)} linhas aproveitadas")
 
     if not frames:
         if debug:
