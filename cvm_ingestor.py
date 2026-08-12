@@ -520,12 +520,35 @@ def processar_ano(zf, ano, prefixo, period_type, mapa_ticker, debug=False):
     return linhas
 
 
-def gravar(engine, linhas):
+def gravar(engine, linhas, ano=None, period_type=None):
+    """Grava as linhas, substituindo por completo o que já existia da CVM
+    naquele ano/periodicidade.
+
+    POR QUE APAGAR ANTES: o ON CONFLICT DO UPDATE só toca nas linhas que o
+    código ESCREVE. Linhas gravadas por uma versão anterior - e que o código
+    atual não produz mais - ficariam órfãs no banco, com valores errados.
+
+    Foi o que aconteceu quando o BTG era tratado pelo plano padrão: gravou-se
+    Current Assets, EBIT e afins, contas que não existem no plano de banco.
+    Depois de corrigir a detecção, essas linhas continuaram lá e faziam o BTG
+    ainda parecer uma empresa comum nas validações.
+
+    Apagar o ano antes torna cada carga uma substituição limpa - e o problema
+    não volta em nenhuma recarga futura."""
     if not linhas:
         return 0
     conn = engine.raw_connection()
     try:
         with conn.cursor() as cur:
+            if ano is not None:
+                cur.execute("""
+                    DELETE FROM financials
+                    WHERE source = 'cvm'
+                      AND EXTRACT(YEAR FROM fiscal_date) = %s
+                      AND (%s IS NULL OR period_type = %s)
+                """, (ano, period_type, period_type))
+                if cur.rowcount:
+                    print(f"    (removidas {cur.rowcount} linhas anteriores de {ano} para recarga limpa)")
             execute_values(cur, """
                 INSERT INTO financials
                     (ticker, statement, period_type, fiscal_date, line_item, value, published_date, source)
@@ -572,10 +595,10 @@ def main():
         zf = cvm_fonte.obter_dfp(ano)
         if zf:
             linhas = processar_ano(zf, ano, "dfp", "annual", mapa, debug=args.debug)
-            print(f"  DFP: {len(linhas)} linhas", end="")
+            print(f"  DFP: {len(linhas)} linhas")
             if not args.dry_run:
-                gravar(engine, linhas)
-                print(" (gravadas)")
+                gravar(engine, linhas, ano=ano, period_type="annual")
+                print("    (gravadas)")
             else:
                 print(" (dry-run, não gravadas)")
             total += len(linhas)
@@ -584,10 +607,10 @@ def main():
             zfi = cvm_fonte.obter_itr(ano)
             if zfi:
                 linhas = processar_ano(zfi, ano, "itr", "quarterly", mapa, debug=args.debug)
-                print(f"  ITR: {len(linhas)} linhas", end="")
+                print(f"  ITR: {len(linhas)} linhas")
                 if not args.dry_run:
-                    gravar(engine, linhas)
-                    print(" (gravadas)")
+                    gravar(engine, linhas, ano=ano, period_type="quarterly")
+                    print("    (gravadas)")
                 else:
                     print(" (dry-run)")
                 total += len(linhas)
