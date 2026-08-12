@@ -205,22 +205,42 @@ def _fatores_unit(precos, tickers):
     Onde não existir a ON correspondente para comparar, o fator fica 1 e o
     valor de mercado daquela unit segue superestimado - situação sinalizada
     no retorno para quem quiser tratar."""
-    fatores = {}
+    fatores, sem_referencia = {}, []
     for tk in tickers:
         base = str(tk).replace(".SA", "")
         if not base.endswith("11"):
             continue
         prefixo = base[:4]
-        # candidatas: ON (3) da mesma empresa, com preço disponível
-        on = f"{prefixo}3.SA"
-        p_unit, p_on = precos.get(tk), precos.get(on)
-        if p_unit is None or p_on is None or pd.isna(p_unit) or pd.isna(p_on) or p_on <= 0:
+        p_unit = precos.get(tk)
+        if p_unit is None or pd.isna(p_unit):
             continue
-        razao = float(p_unit) / float(p_on)
-        # units costumam conter de 2 a 6 ações; fora disso é provável que
-        # sejam empresas diferentes com prefixo parecido, não uma unit
-        if 1.5 <= razao <= 8:
+
+        # Procura QUALQUER classe individual da mesma empresa como referência:
+        # ON (3), PN (4), PNA (5), PNB (6). Não basta olhar a ON - existem
+        # units compostas só de preferenciais (PN, ou PNA+PNB), sem nenhuma
+        # ordinária. E há empresas cuja ON existe mas não negocia, ficando
+        # sem preço no dia.
+        razao = None
+        for sufixo in ("3", "4", "5", "6"):
+            p_ref = precos.get(f"{prefixo}{sufixo}.SA")
+            if p_ref is None or pd.isna(p_ref) or p_ref <= 0:
+                continue
+            r = float(p_unit) / float(p_ref)
+            # units contêm tipicamente de 2 a 6 ações; fora dessa faixa é
+            # mais provável ser outra empresa com prefixo parecido
+            if 1.5 <= r <= 8:
+                razao = r
+                break
+        if razao is not None:
             fatores[tk] = round(razao)
+        else:
+            sem_referencia.append(tk)
+
+    if sem_referencia:
+        print(f"    aviso: {len(sem_referencia)} unit(s) sem classe individual para inferir "
+              f"a composição - valor de mercado delas fica SUPERESTIMADO: "
+              f"{', '.join(sorted(sem_referencia)[:8])}"
+              + (f" e mais {len(sem_referencia)-8}" if len(sem_referencia) > 8 else ""))
     return fatores
 
 
