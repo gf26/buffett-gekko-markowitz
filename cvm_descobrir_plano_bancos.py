@@ -36,6 +36,8 @@ import zipfile
 
 import pandas as pd
 import requests
+
+import cvm_fonte
 from sqlalchemy import create_engine, text
 
 URL_DFP = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/DFP/DADOS/dfp_cia_aberta_{ano}.zip"
@@ -117,11 +119,11 @@ def main():
 
     # modo dump: não precisa de classificação setorial, vai direto ao arquivo
     if args.dump:
-        print(f"Baixando DFP {args.ano}...")
-        resp = requests.get(URL_DFP.format(ano=args.ano), timeout=300)
-        resp.raise_for_status()
-        zf = zipfile.ZipFile(io.BytesIO(resp.content))
-        print(f"  {len(resp.content)/1_000_000:.1f} MB")
+        # usa o cache local (dados_cvm/) - o servidor da CVM bloqueia
+        # conexões vindas do Codespace por faixa de IP
+        zf = cvm_fonte.obter_dfp(args.ano)
+        if zf is None:
+            raise SystemExit(f"DFP {args.ano} não disponível. Veja: python cvm_fonte.py --listar")
         for cd in args.dump:
             dump_empresa(zf, args.ano, str(cd).strip().lstrip("0"), args.nivel_max)
         return
@@ -146,11 +148,9 @@ def main():
     if not financeiros:
         raise SystemExit("Nenhuma empresa financeira mapeada - confira company_info e ticker_cvm_map.")
 
-    print(f"\nBaixando DFP {args.ano}...")
-    resp = requests.get(URL_DFP.format(ano=args.ano), timeout=300)
-    resp.raise_for_status()
-    zf = zipfile.ZipFile(io.BytesIO(resp.content))
-    print(f"  {len(resp.content)/1_000_000:.1f} MB")
+    zf = cvm_fonte.obter_dfp(args.ano)
+    if zf is None:
+        raise SystemExit(f"DFP {args.ano} não disponível. Veja: python cvm_fonte.py --listar")
 
     linhas = []
     for sigla in ["BPA", "BPP", "DRE", "DFC_MI"]:
