@@ -188,6 +188,42 @@ def compute_piotroski_row(bs, bs1, inc, inc1, cf, ticker):
     return sum(1 for c in known if c) if known else None
 
 
+def _fatores_unit(precos, tickers):
+    """Quantas ações cada unit representa, inferido do PREÇO.
+
+    Uma unit é um pacote (ex: SANB11 = 1 ON + 1 PN; BPAC11 = 1 ON + 2 PN).
+    O preço negociado é do pacote inteiro, mas o balanço conta ações
+    individuais - então `preço x ações` infla o valor de mercado da empresa
+    pelo tamanho do pacote.
+
+    Em vez de manter uma tabela fixa de composições (que envelhece a cada
+    reestruturação), inferimos o fator da razão entre o preço da unit e o
+    preço da ON da mesma empresa: se a unit vale 3x a ON, ela contém ~3
+    ações. É aproximado - PN e ON têm preços um pouco diferentes -, mas o
+    erro é de poucos por cento contra os 200-300% de não corrigir.
+
+    Onde não existir a ON correspondente para comparar, o fator fica 1 e o
+    valor de mercado daquela unit segue superestimado - situação sinalizada
+    no retorno para quem quiser tratar."""
+    fatores = {}
+    for tk in tickers:
+        base = str(tk).replace(".SA", "")
+        if not base.endswith("11"):
+            continue
+        prefixo = base[:4]
+        # candidatas: ON (3) da mesma empresa, com preço disponível
+        on = f"{prefixo}3.SA"
+        p_unit, p_on = precos.get(tk), precos.get(on)
+        if p_unit is None or p_on is None or pd.isna(p_unit) or pd.isna(p_on) or p_on <= 0:
+            continue
+        razao = float(p_unit) / float(p_on)
+        # units costumam conter de 2 a 6 ações; fora disso é provável que
+        # sejam empresas diferentes com prefixo parecido, não uma unit
+        if 1.5 <= razao <= 8:
+            fatores[tk] = round(razao)
+    return fatores
+
+
 def build_metrics_snapshot(all_fin, as_of, prices_adj, shares_df, sectors):
     """Reconstrói, para `as_of`, a tabela de métricas por ticker que
     alimenta o ranking (equivalente ao `fundamental_ratios` daquela data)."""
@@ -212,13 +248,20 @@ def build_metrics_snapshot(all_fin, as_of, prices_adj, shares_df, sectors):
         latest = sh_avail.sort_values("fiscal_date").drop_duplicates("ticker", keep="last")
         shares_map = dict(zip(latest["ticker"], latest["shares"]))
 
+    fator_unit = _fatores_unit(last_px, shares_map.keys())
+
     rows = []
     for ticker in bs.index:
         price = last_px.get(ticker)
         if price is None or pd.isna(price):
             continue
         shares = shares_map.get(ticker)
-        market_cap = float(price) * float(shares) if shares else None
+        # UNITS: o preço é de um pacote (ex: 1 ON + 2 PN), mas a contagem de
+        # ações do balanço é em ações INDIVIDUAIS. Multiplicar direto infla o
+        # valor de mercado pelo tamanho do pacote. Dividimos o preço pelo
+        # fator de composição para trazê-lo à base "por ação".
+        preco_por_acao = float(price) / fator_unit.get(ticker, 1.0)
+        market_cap = preco_por_acao * float(shares) if shares else None
 
         book = g(bs, ticker, "Stockholders Equity", "Common Stock Equity")
         cash = g(bs, ticker, "Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments", default=0)
@@ -283,6 +326,33 @@ def compute_composite(metrics):
     return df
 
 
+def _dedup_por_empresa(df, adtv_map=None):
+    """Um ticker por empresa, o de maior liquidez.
+
+    POR QUE: depois de incluir as classes PN e units, várias empresas têm
+    dois tickers no universo (ITUB3+ITUB4, PETR3+PETR4, BBDC3+BBDC4). Para o
+    otimizador eles são ativos DISTINTOS, e ele pode alocar em ambos achando
+    que diversifica - quando é a mesma empresa, com correlação perto de 1. A
+    diversificação vira ilusão e o risco real da carteira fica maior que o
+    calculado.
+
+    A empresa é identificada pelo prefixo de 4 letras do código B3, que é
+    como a B3 organiza as classes de um mesmo emissor.
+
+    Critério de desempate: liquidez. É o que determina se a posição é
+    executável de verdade - de nada adianta preferir a ON se ela não
+    negocia."""
+    if df.empty:
+        return df
+    d = df.copy()
+    d["_empresa"] = [str(t).replace(".SA", "")[:4] for t in d.index]
+    d["_liquidez"] = [float((adtv_map or {}).get(t) or 0) for t in d.index]
+    # em empate de liquidez, fica o de melhor pontuação
+    d = d.sort_values(["_liquidez", "composite_percentile"], ascending=[False, False])
+    d = d[~d["_empresa"].duplicated(keep="first")]
+    return d.drop(columns=["_empresa", "_liquidez"])
+
+
 def select_portfolio(scored, n_assets=10, piotroski_min=7, by_sector=False,
                      n_per_sector=2, allowed_sectors=None, min_adtv=None, adtv_map=None):
     """
@@ -304,6 +374,8 @@ def select_portfolio(scored, n_assets=10, piotroski_min=7, by_sector=False,
 
     if df.empty:
         return []
+
+    df = _dedup_por_empresa(df, adtv_map)
 
     if not by_sector:
         return df.nlargest(n_assets, "composite_percentile").index.tolist()
