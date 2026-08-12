@@ -191,6 +191,36 @@ def compute_piotroski_row(bs, bs1, inc, inc1, cf, ticker):
 def _fatores_unit(precos, tickers):
     """Quantas ações cada unit representa, inferido do PREÇO.
 
+    ############################################################
+    # SOLUÇÃO TEMPORÁRIA - SUBSTITUIR QUANDO O FRE ENTRAR
+    #
+    # Esta função existe porque hoje só temos o TOTAL de ações da empresa,
+    # sem saber quantas são ON e quantas são PN. Sem essa separação, o único
+    # jeito de lidar com units é inferir o tamanho do pacote pela razão de
+    # preços - o que é aproximado e falha quando nenhuma classe individual
+    # negocia.
+    #
+    # O FRE (fre_cia_aberta_capital_social_AAAA.csv) traz a contagem POR
+    # CLASSE: Quantidade_Acoes_Ordinarias e Quantidade_Acoes_Preferenciais.
+    # Com isso, o valor de mercado passa a ser calculado direto e sem
+    # aproximação:
+    #
+    #     market_cap = (qtd_ON x preço_da_ON) + (qtd_PN x preço_da_PN)
+    #
+    # Isso é melhor por três motivos:
+    #   1. Elimina a inferência do fator da unit - some a fonte de erro.
+    #   2. Resolve as units sem classe de referência, que hoje ficam
+    #      superestimadas e apenas sinalizadas por aviso.
+    #   3. Corrige um erro que atinge TODAS as empresas com duas classes,
+    #      não só as units: hoje multiplicamos o total de ações por UM preço
+    #      só, ignorando que ON e PN negociam com preços diferentes (o
+    #      spread entre ITUB3 e ITUB4, por exemplo, é relevante).
+    #
+    # QUANDO IMPLEMENTAR: apagar esta função inteira e reescrever o cálculo
+    # de market_cap em build_metrics_snapshot.
+    ############################################################
+
+
     Uma unit é um pacote (ex: SANB11 = 1 ON + 1 PN; BPAC11 = 1 ON + 2 PN).
     O preço negociado é do pacote inteiro, mas o balanço conta ações
     individuais - então `preço x ações` infla o valor de mercado da empresa
