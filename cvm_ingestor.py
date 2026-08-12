@@ -39,18 +39,18 @@ Uso:
     DATABASE_URL="..." python cvm_ingestor.py --de 2024 --ate 2024 --dry-run
 """
 import argparse
-import io
 import os
 import re
-import zipfile
 
 import pandas as pd
-import requests
 from sqlalchemy import create_engine, text
 from psycopg2.extras import execute_values
 
-URL_DFP = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/DFP/DADOS/dfp_cia_aberta_{ano}.zip"
-URL_ITR = "https://dados.cvm.gov.br/dados/CIA_ABERTA/DOC/ITR/DADOS/itr_cia_aberta_{ano}.zip"
+import cvm_fonte
+
+# URLs e cache local ficam em cvm_fonte.py - o servidor da CVM bloqueia
+# conexões vindas do Codespace, então os arquivos são baixados pelo
+# navegador e lidos de dados_cvm/. Ver ATUALIZACAO_MANUAL_CVM.md
 
 ESCALA = {"UNIDADE": 1, "MIL": 1_000, "MILHAR": 1_000, "MILHÃO": 1_000_000, "MILHAO": 1_000_000}
 
@@ -191,17 +191,6 @@ RE_CONTROLADOR = re.compile(r"controlador", re.IGNORECASE)
 PADRAO_CAPEX = re.compile(
     r"(?:aquisi\w*|compra\w*|adi\w*)\s+.*(?:imobilizado|ativo\s+imobilizado|intang)", re.IGNORECASE
 )
-
-
-def baixar_zip(url):
-    print(f"  baixando {url.split('/')[-1]} ...", end=" ", flush=True)
-    resp = requests.get(url, timeout=300)
-    if resp.status_code == 404:
-        print("não existe (pulando)")
-        return None
-    resp.raise_for_status()
-    print(f"{len(resp.content) / 1_000_000:.1f} MB")
-    return zipfile.ZipFile(io.BytesIO(resp.content))
 
 
 def ler_csv(zf, nome):
@@ -570,7 +559,7 @@ def main():
     total = 0
     for ano in range(args.de, args.ate + 1):
         print(f"--- {ano} ---")
-        zf = baixar_zip(URL_DFP.format(ano=ano))
+        zf = cvm_fonte.obter_dfp(ano)
         if zf:
             linhas = processar_ano(zf, ano, "dfp", "annual", mapa, debug=args.debug)
             print(f"  DFP: {len(linhas)} linhas", end="")
@@ -582,7 +571,7 @@ def main():
             total += len(linhas)
 
         if args.trimestral:
-            zfi = baixar_zip(URL_ITR.format(ano=ano))
+            zfi = cvm_fonte.obter_itr(ano)
             if zfi:
                 linhas = processar_ano(zfi, ano, "itr", "quarterly", mapa, debug=args.debug)
                 print(f"  ITR: {len(linhas)} linhas", end="")
