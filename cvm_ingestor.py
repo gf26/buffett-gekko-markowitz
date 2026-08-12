@@ -276,18 +276,56 @@ def extrair_capex(zf, ano, prefixo):
 
 
 def acoes_em_circulacao(zf, ano, prefixo):
-    """Número de ações, do arquivo de composição de capital."""
+    """Ações em circulação, do arquivo de composição de capital.
+
+    TRÊS ARMADILHAS DESTE ARQUIVO (as três quebraram a versão anterior, que
+    devolvia vazio silenciosamente - por isso o market cap histórico nunca
+    existiu e o backtest só funcionava de 2023 em diante):
+
+    1. Ele identifica a empresa por CNPJ_CIA, NÃO por CD_CVM. É o único
+       arquivo do pacote assim. Precisa de um de-para CNPJ -> CD_CVM, que
+       montamos a partir do arquivo-resumo (que tem os dois).
+    2. As colunas são QT_ACAO_*, não QTD_*.
+    3. "Ações em circulação" = total integralizado MENOS as em tesouraria.
+       Ações recompradas pela própria empresa não circulam e não entram no
+       valor de mercado.
+    """
     df = ler_csv(zf, f"{prefixo}_cia_aberta_composicao_capital_{ano}.csv")
+    if df.empty or "CNPJ_CIA" not in df.columns:
+        return pd.DataFrame()
+
+    col_total = "QT_ACAO_TOTAL_CAP_INTEGR"
+    col_tesouro = "QT_ACAO_TOTAL_TESOURO"
+    if col_total not in df.columns:
+        print(f"    aviso: {col_total} não encontrada em composicao_capital - "
+              f"colunas disponíveis: {list(df.columns)}")
+        return pd.DataFrame()
+
+    df = df.copy()
+    df[col_total] = pd.to_numeric(df[col_total], errors="coerce")
+    if col_tesouro in df.columns:
+        df[col_tesouro] = pd.to_numeric(df[col_tesouro], errors="coerce").fillna(0)
+    else:
+        df[col_tesouro] = 0
+    df["acoes"] = df[col_total] - df[col_tesouro]
+
+    if "VERSAO" in df.columns:
+        df["VERSAO"] = pd.to_numeric(df["VERSAO"], errors="coerce")
+        df = df.sort_values("VERSAO").drop_duplicates(["CNPJ_CIA", "DT_REFER"], keep="last")
+
+    # de-para CNPJ -> CD_CVM, a partir do arquivo-resumo
+    resumo = ler_csv(zf, f"{prefixo}_cia_aberta_{ano}.csv")
+    if resumo.empty or "CNPJ_CIA" not in resumo.columns or "CD_CVM" not in resumo.columns:
+        print("    aviso: não consegui montar o de-para CNPJ->CD_CVM")
+        return pd.DataFrame()
+    mapa = resumo[["CNPJ_CIA", "CD_CVM"]].drop_duplicates("CNPJ_CIA")
+
+    df = df.merge(mapa, on="CNPJ_CIA", how="inner")
     if df.empty:
         return pd.DataFrame()
-    col_qtd = next((c for c in df.columns if "QTD" in c.upper() and "ACAO" in c.upper()
-                     and "TESOU" not in c.upper()), None)
-    if not col_qtd or "CD_CVM" not in df.columns:
-        return pd.DataFrame()
-    df[col_qtd] = pd.to_numeric(df[col_qtd], errors="coerce")
-    col_data = "DT_FIM_EXERC" if "DT_FIM_EXERC" in df.columns else "DT_REFER"
-    agg = df.groupby(["CD_CVM", col_data], as_index=False)[col_qtd].sum()
-    agg = agg.rename(columns={col_qtd: "VL_CONTA", col_data: "DT_FIM_EXERC"})
+
+    agg = df[["CD_CVM", "DT_REFER", "acoes"]].dropna(subset=["acoes"])
+    agg = agg.rename(columns={"acoes": "VL_CONTA", "DT_REFER": "DT_FIM_EXERC"})
     agg["line_item"] = "Ordinary Shares Number"
     return agg
 
