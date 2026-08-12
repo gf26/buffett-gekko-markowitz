@@ -86,7 +86,12 @@ def localizar_pl(g):
     pai = pais.loc[pais["CD_CONTA"].str.count(r"\.").idxmin()]
     raiz, total = pai["CD_CONTA"], pai["VL_CONTA"]
 
-    filhas = g[g["CD_CONTA"].str.startswith(raiz + ".")]
+    # SÓ filhas diretas (um nível abaixo). Sem isso, uma conta neta cuja
+    # descrição menciona "controlador" (ex: 2.03.02.09 "Opções Outorgadas a
+    # Não Controladores") seria escolhida no lugar da conta correta - o que
+    # quebraria empresas hoje corretas como TOTS3, EMBJ3, PASS3.
+    filhas = g[g["CD_CONTA"].str.startswith(raiz + ".")
+               & (g["CD_CONTA"].str.count(r"\.") == raiz.count(".") + 1)]
     # 1ª opção: conta que já dá o valor dos controladores, pronto
     contr = filhas[filhas["DS_CONTA"].str.contains(RE_CONTROLADOR, na=False)
                    & ~filhas["DS_CONTA"].str.contains(RE_NAO_CONTROLADOR, na=False)]
@@ -107,7 +112,8 @@ def localizar_lucro(g):
         return None, None, "não encontrado"
     pai = cand.loc[cand["CD_CONTA"].str.count(r"\.").idxmin()]
     raiz, total = pai["CD_CONTA"], pai["VL_CONTA"]
-    filhas = g[g["CD_CONTA"].str.startswith(raiz + ".")]
+    filhas = g[g["CD_CONTA"].str.startswith(raiz + ".")
+               & (g["CD_CONTA"].str.count(r"\.") == raiz.count(".") + 1)]
     contr = filhas[filhas["DS_CONTA"].str.contains(RE_CONTROLADOR, na=False)
                    & ~filhas["DS_CONTA"].str.contains(RE_NAO_CONTROLADOR, na=False)]
     if not contr.empty:
