@@ -1,0 +1,255 @@
+"""
+Ingestor do FRE - quantidade de ações por classe.
+
+O QUE RESOLVE
+-------------
+Três problemas de uma vez (itens 1, 2 e 3 do PENDENCIAS.md):
+
+1. AUSÊNCIA DE DADOS ANTES DE 2020. A CVM só publica `composicao_capital` a
+   partir de 2020. Sem número de ações não há valor de mercado, e sem valor
+   de mercado não existem P/L, P/VPA, Earnings Yield nem FCF Yield - todo o
+   lado de valuation do screener. O FRE cobre 2010-2025.
+
+2. ESCALA INCONSISTENTE. O `composicao_capital` mistura unidades sem avisar:
+   no mesmo arquivo de 2024, Banco do Brasil aparece com 5.730.834.040
+   (unidades) e Lojas Renner com 1.059.550 (milhares). O FRE foi verificado
+   em 2010, 2015, 2020 e 2024 e é consistente.
+
+3. VALOR DE MERCADO DE UNITS E DE EMPRESAS COM DUAS CLASSES. O FRE separa
+   ordinárias de preferenciais, o que permite calcular
+   `market_cap = (qtd_ON x preço_ON) + (qtd_PN x preço_PN)` em vez de
+   multiplicar o total por um preço só.
+
+DECISÕES DE PROJETO
+-------------------
+- Usa APENAS `Tipo_Capital = 'Capital Integralizado'`. O arquivo traz quatro
+  tipos e a diferença é grande: a Vale tem 5,37 bi de integralizado contra
+  10,8 bi de AUTORIZADO - que é um teto estatutário, não ações existentes.
+- Deduplica por versão: o arquivo repete a mesma empresa várias vezes.
+- Grava com `source = 'cvm_fre'`, separado do resto, para permitir comparar
+  com o que veio de `composicao_capital` antes de descartá-lo.
+
+Uso:
+    DATABASE_URL="..." python cvm_ingestor_fre.py --de 2010 --ate 2025 --dry-run
+    DATABASE_URL="..." python cvm_ingestor_fre.py --de 2010 --ate 2025
+"""
+import argparse
+import os
+import warnings
+import zipfile
+
+import pandas as pd
+from psycopg2.extras import execute_values
+from sqlalchemy import create_engine, text
+
+import cvm_fonte
+
+warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
+
+PASTA_CACHE = "dados_cvm"
+TIPO_CAPITAL = "Capital Integralizado"
+
+COLUNAS = {
+    "Quantidade_Acoes_Ordinarias": "Ordinary Shares Number",
+    "Quantidade_Acoes_Preferenciais": "Preferred Shares Number",
+    "Quantidade_Total_Acoes": "Total Shares Number",
+}
+
+
+def abrir_fre(ano):
+    caminho = os.path.join(PASTA_CACHE, f"fre_cia_aberta_{ano}.zip")
+    if not os.path.exists(caminho):
+        return None
+    return zipfile.ZipFile(caminho)
+
+
+def ler_capital_social(ano):
+    zf = abrir_fre(ano)
+    if zf is None:
+        print(f"  {ano}: arquivo FRE não encontrado em {PASTA_CACHE}/")
+        return pd.DataFrame()
+    nome = f"fre_cia_aberta_capital_social_{ano}.csv"
+    if nome not in zf.namelist():
+        print(f"  {ano}: sem capital_social no zip")
+        return pd.DataFrame()
+
+    with zf.open(nome) as f:
+        df = pd.read_csv(f, sep=";", encoding="latin-1", dtype=str)
+
+    if "Tipo_Capital" not in df.columns:
+        print(f"  {ano}: coluna Tipo_Capital ausente - colunas: {list(df.columns)}")
+        return pd.DataFrame()
+
+    df = df[df["Tipo_Capital"] == TIPO_CAPITAL].copy()
+    if df.empty:
+        print(f"  {ano}: nenhuma linha com Tipo_Capital = {TIPO_CAPITAL!r}")
+        return df
+
+    for c in COLUNAS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # versão mais recente por empresa/data (o arquivo repete linhas)
+    if "Versao" in df.columns:
+        df["Versao"] = pd.to_numeric(df["Versao"], errors="coerce")
+        chaves = [c for c in ["CNPJ_Companhia", "Data_Referencia"] if c in df.columns]
+        if chaves:
+            df = df.sort_values("Versao").drop_duplicates(chaves, keep="last")
+
+    df["_ano_arquivo"] = ano
+    return df
+
+
+def mapa_cnpj_cd_cvm(anos):
+    """CNPJ -> CD_CVM, montado a partir dos arquivos DFP (que têm os dois).
+
+    O FRE identifica empresas só por CNPJ; nossa `ticker_cvm_map` usa CD_CVM.
+    Percorre vários anos porque uma empresa pode não estar em todos."""
+    mapa = {}
+    for ano in anos:
+        try:
+            zf = cvm_fonte.obter_dfp(ano, permitir_download=False)
+        except (FileNotFoundError, SystemExit):
+            continue
+        if zf is None:
+            continue
+        nome = f"dfp_cia_aberta_{ano}.csv"
+        if nome not in zf.namelist():
+            continue
+        with zf.open(nome) as f:
+            d = pd.read_csv(f, sep=";", encoding="latin-1",
+                             dtype={"CNPJ_CIA": str, "CD_CVM": str})
+        if "CNPJ_CIA" not in d.columns or "CD_CVM" not in d.columns:
+            continue
+        d["CD_CVM"] = d["CD_CVM"].str.strip().str.lstrip("0")
+        for cnpj, cd in zip(d["CNPJ_CIA"], d["CD_CVM"]):
+            mapa.setdefault(str(cnpj).strip(), cd)
+    return mapa
+
+
+def carregar_tickers(engine):
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT ticker, cd_cvm FROM ticker_cvm_map")).fetchall()
+    por_cd = {}
+    for ticker, cd in rows:
+        por_cd.setdefault(str(cd).strip().lstrip("0"), []).append(ticker)
+    return por_cd
+
+
+def montar_linhas(df, cnpj_para_cd, cd_para_tickers, ano):
+    """Uma linha por (ticker, classe de ação). fiscal_date = 31/12 do ano do
+    arquivo: o FRE descreve a posição de capital do exercício de referência."""
+    fiscal_date = pd.Timestamp(year=ano, month=12, day=31).date()
+    linhas, sem_cd, sem_ticker = [], set(), set()
+
+    for _, r in df.iterrows():
+        cnpj = str(r.get("CNPJ_Companhia", "")).strip()
+        cd = cnpj_para_cd.get(cnpj)
+        if not cd:
+            sem_cd.add(cnpj)
+            continue
+        tickers = cd_para_tickers.get(cd)
+        if not tickers:
+            sem_ticker.add(cd)
+            continue
+        for col, line_item in COLUNAS.items():
+            valor = r.get(col)
+            if pd.isna(valor) or valor is None:
+                continue
+            for tk in tickers:
+                linhas.append((tk, "balance_sheet", "annual", fiscal_date,
+                                line_item, float(valor), None, "cvm_fre"))
+    return linhas, sem_cd, sem_ticker
+
+
+def gravar(engine, linhas, ano):
+    if not linhas:
+        return 0
+    conn = engine.raw_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                DELETE FROM financials
+                WHERE source = 'cvm_fre' AND EXTRACT(YEAR FROM fiscal_date) = %s
+            """, (ano,))
+            if cur.rowcount:
+                print(f"    (removidas {cur.rowcount} linhas anteriores de {ano})")
+            execute_values(cur, """
+                INSERT INTO financials
+                    (ticker, statement, period_type, fiscal_date, line_item, value, published_date, source)
+                VALUES %s
+                ON CONFLICT (ticker, statement, period_type, fiscal_date, line_item)
+                DO UPDATE SET value = EXCLUDED.value, source = EXCLUDED.source, fetched_at = now()
+            """, linhas, page_size=1000)
+        conn.commit()
+    finally:
+        conn.close()
+    return len(linhas)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Ingestor do FRE (quantidade de ações por classe).")
+    p.add_argument("--de", type=int, default=2010)
+    p.add_argument("--ate", type=int, default=2025)
+    p.add_argument("--dry-run", action="store_true")
+    args = p.parse_args()
+
+    engine = create_engine(os.environ["DATABASE_URL"])
+    cd_para_tickers = carregar_tickers(engine)
+    if not cd_para_tickers:
+        raise SystemExit("ticker_cvm_map vazia.")
+    print(f"{len(cd_para_tickers)} empresas mapeadas para tickers\n")
+
+    print("Montando de-para CNPJ -> CD_CVM a partir dos arquivos DFP...")
+    anos = list(range(args.de, args.ate + 1))
+    cnpj_para_cd = mapa_cnpj_cd_cvm(anos)
+    print(f"  {len(cnpj_para_cd)} CNPJs mapeados\n")
+    if not cnpj_para_cd:
+        raise SystemExit("Não consegui montar o de-para CNPJ->CD_CVM. "
+                          "Confira se os arquivos DFP estão em dados_cvm/.")
+
+    total, resumo = 0, []
+    for ano in anos:
+        df = ler_capital_social(ano)
+        if df.empty:
+            continue
+        linhas, sem_cd, sem_ticker = montar_linhas(df, cnpj_para_cd, cd_para_tickers, ano)
+        n_tickers = len({l[0] for l in linhas})
+        print(f"  {ano}: {len(df):>5} empresas no FRE -> {len(linhas):>5} linhas, {n_tickers:>3} tickers"
+              f"  (sem CD_CVM: {len(sem_cd)}, sem ticker: {len(sem_ticker)})")
+        resumo.append({"ano": ano, "empresas_fre": len(df), "tickers": n_tickers})
+        if not args.dry_run:
+            gravar(engine, linhas, ano)
+        total += len(linhas)
+
+    print(f"\nTotal: {total} linhas" + (" (dry-run, nada gravado)" if args.dry_run else " gravadas"))
+
+    if resumo:
+        r = pd.DataFrame(resumo)
+        print("\nCobertura por ano:")
+        print(r.to_string(index=False))
+        mediana = r["tickers"].median()
+        fracos = r[r["tickers"] < mediana * 0.6]
+        if not fracos.empty:
+            print(f"\n  ATENÇÃO: anos com cobertura bem abaixo da mediana ({mediana:.0f} tickers):")
+            print(fracos.to_string(index=False))
+
+    if not args.dry_run:
+        with engine.connect() as conn:
+            comp = pd.read_sql(text("""
+                SELECT source, line_item, COUNT(*) AS linhas,
+                       COUNT(DISTINCT ticker) AS tickers,
+                       MIN(fiscal_date) AS de, MAX(fiscal_date) AS ate
+                FROM financials
+                WHERE line_item IN ('Ordinary Shares Number','Preferred Shares Number','Total Shares Number')
+                GROUP BY source, line_item ORDER BY source, line_item
+            """), conn)
+        print("\nContagem de ações no banco, por fonte:")
+        print(comp.to_string(index=False))
+        print("\nPróximo passo: comparar 'cvm_fre' com 'cvm' nos anos 2020-2025 para")
+        print("confirmar a correção de escala, e então reescrever o cálculo de")
+        print("market cap por classe em scoring.py (item 1 do PENDENCIAS.md).")
+
+
+if __name__ == "__main__":
+    main()
