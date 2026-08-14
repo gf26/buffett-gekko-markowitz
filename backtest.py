@@ -252,20 +252,52 @@ def benchmark_curve(prices_adj, dates, ticker):
     return pd.DataFrame(out)
 
 
+RETORNO_MAX_PERIODO = 5.0    # +400% num trimestre
+RETORNO_MIN_PERIODO = -0.95  # -95% num trimestre
+
+
 def universe_equal_weight_curve(prices_adj, dates, adtv_map, min_adtv):
-    """1/N sobre o universo inteiro (líquido), o teste de sanidade central."""
+    """1/N sobre o universo líquido - o teste de sanidade central.
+
+    DOIS FILTROS, e ambos existem por um motivo concreto:
+
+    1. RETORNO IMPLAUSÍVEL. A AZEV3 aparece cotada a R$ 0,0001 por parte de
+       740 pregões e depois salta para R$ 302,82 - fator de 3 milhões num
+       único dia. Não é evento de mercado: é o `adj_close` do Yahoo ficando
+       inconsistente na virada de um grupamento. Um único caso desses levou o
+       1/N a reportar 10.292.549% de retorno acumulado, inutilizando a
+       referência. Retornos fora da faixa são descartados, não zerados - o
+       dado é desconhecido, não nulo.
+
+    2. NEGOCIAÇÃO EFETIVA NO PERÍODO. O filtro anterior usava `adtv_map`, que
+       é a liquidez de HOJE, aplicada retroativamente a todos os períodos. Um
+       papel líquido agora passava no filtro em 2011, quando talvez nem
+       negociasse. Exigir preço nas duas pontas da janela é uma aproximação
+       melhor: se não há cotação, não havia como comprar."""
     liquid = [t for t in prices_adj.columns
               if t != "^BVSP" and (adtv_map.get(t) or 0) >= min_adtv]
     out, eq = [], 1.0
+    descartados = 0
     for i, d in enumerate(dates[:-1]):
         window = prices_adj.loc[d:dates[i + 1], liquid]
         if len(window) < 2:
             continue
-        rets = (window.iloc[-1] / window.iloc[0] - 1).dropna()
+        inicio, fim = window.iloc[0], window.iloc[-1]
+        # só quem tem preço nas duas pontas era negociável no período
+        validos = inicio.notna() & fim.notna() & (inicio > 0)
+        rets = (fim[validos] / inicio[validos] - 1)
+        plausivel = rets.between(RETORNO_MIN_PERIODO, RETORNO_MAX_PERIODO)
+        descartados += int((~plausivel).sum())
+        rets = rets[plausivel]
         if rets.empty:
             continue
         eq *= (1 + float(rets.mean()))
-        out.append({"date": d, "next_date": dates[i + 1], "return_pct": float(rets.mean()) * 100, "equity": eq})
+        out.append({"date": d, "next_date": dates[i + 1],
+                    "return_pct": float(rets.mean()) * 100, "equity": eq,
+                    "n_ativos": int(len(rets))})
+    if descartados:
+        print(f"  (1/N: {descartados} retornos implausíveis descartados - "
+              f"provável erro de ajuste de proventos na fonte)")
     return pd.DataFrame(out)
 
 
