@@ -175,8 +175,21 @@ def montar_linhas(df, cnpj_para_cd, cd_para_tickers, ano):
     linhas, sem_cd, sem_ticker = [], set(), set()
     datas_usadas = {}
 
+    # DEDUPLICAÇÃO POR EXERCÍCIO, não por Data_Referencia.
+    # Uma mesma empresa pode aparecer no arquivo com duas datas de referência
+    # diferentes (ex: 2013-01-01 e 2013-06-30) que caem no MESMO exercício
+    # fiscal. Sem isso, o INSERT recebe duas linhas com a mesma chave e o
+    # Postgres recusa o lote inteiro (CardinalityViolation). Fica a referência
+    # mais recente, que é a informação mais atualizada daquele exercício.
+    df = df.copy()
+    df["_fiscal_date"] = [fiscal_date_de(d, ano) for d in df.get("Data_Referencia", [None] * len(df))]
+    ordem = [c for c in ["Versao", "Data_Referencia"] if c in df.columns]
+    if ordem:
+        df = df.sort_values(ordem)
+    df = df.drop_duplicates(["CNPJ_Companhia", "_fiscal_date"], keep="last")
+
     for _, r in df.iterrows():
-        fiscal_date = fiscal_date_de(r.get("Data_Referencia"), ano)
+        fiscal_date = r["_fiscal_date"]
         datas_usadas[fiscal_date] = datas_usadas.get(fiscal_date, 0) + 1
         cnpj = str(r.get("CNPJ_Companhia", "")).strip()
         cd = cnpj_para_cd.get(cnpj)
@@ -200,6 +213,19 @@ def montar_linhas(df, cnpj_para_cd, cd_para_tickers, ano):
 def gravar(engine, linhas, ano):
     if not linhas:
         return 0
+    # rede de segurança: garante chave única no lote, independentemente da
+    # origem da duplicata. A chave é (ticker, statement, period_type,
+    # fiscal_date, line_item) - posições 0,1,2,3,4 da tupla.
+    vistos, unicas = set(), []
+    for l in linhas:
+        k = (l[0], l[1], l[2], l[3], l[4])
+        if k in vistos:
+            continue
+        vistos.add(k)
+        unicas.append(l)
+    if len(unicas) < len(linhas):
+        print(f"    ({len(linhas) - len(unicas)} duplicatas descartadas antes de gravar)")
+    linhas = unicas
     conn = engine.raw_connection()
     try:
         with conn.cursor() as cur:
