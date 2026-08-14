@@ -75,22 +75,48 @@ def load_sectors(engine):
 
 
 def load_shares_outstanding(engine):
-    """Ações em circulação por ticker/exercício, do balanço - usado para
-    reconstruir market cap histórico (o 'marketCap' do company_info é só o
-    valor de HOJE, inútil para datas passadas)."""
+    """Ações em circulação POR CLASSE (ON e PN), por ticker/exercício.
+
+    Devolve colunas separadas `shares_on` e `shares_pn`, além de `shares`
+    (total), porque ON e PN negociam a preços diferentes e o valor de mercado
+    correto é a soma por classe - não o total multiplicado por um preço só.
+
+    Prioriza `source = 'cvm_fre'`: é a única fonte com contagem separada por
+    classe, unidade consistente e cobertura de 2009 a 2025. A contagem vinda
+    de `composicao_capital` foi descartada do banco por misturar unidades e
+    milhares sem indicar qual (62% em unidades, 30% em milhares). O Yahoo
+    entra apenas como último recurso, onde o FRE não cobre."""
     with engine.connect() as conn:
         df = pd.read_sql(text("""
-            SELECT ticker, fiscal_date, line_item, value FROM financials
+            SELECT ticker, fiscal_date, line_item, value, source
+            FROM financials
             WHERE statement = 'balance_sheet' AND period_type = 'annual'
-              AND line_item IN ('Ordinary Shares Number', 'Share Issued')
+              AND line_item IN ('Ordinary Shares Number', 'Preferred Shares Number',
+                                 'Total Shares Number', 'Share Issued')
         """), conn)
     if df.empty:
         return df
     df["fiscal_date"] = pd.to_datetime(df["fiscal_date"])
-    # prefere 'Ordinary Shares Number' quando ambos existem
-    df["prio"] = (df["line_item"] == "Ordinary Shares Number").astype(int)
-    df = df.sort_values("prio", ascending=False).drop_duplicates(["ticker", "fiscal_date"])
-    return df[["ticker", "fiscal_date", "value"]].rename(columns={"value": "shares"})
+    # o FRE vence qualquer outra fonte para a mesma célula
+    df["prio"] = (df["source"] == "cvm_fre").astype(int)
+    df = (df.sort_values("prio", ascending=False)
+            .drop_duplicates(["ticker", "fiscal_date", "line_item"]))
+
+    piv = df.pivot_table(index=["ticker", "fiscal_date"], columns="line_item",
+                          values="value", aggfunc="first").reset_index()
+
+    def coluna(nome):
+        return pd.to_numeric(piv[nome], errors="coerce") if nome in piv.columns else pd.Series(pd.NA, index=piv.index)
+
+    piv["shares_on"] = coluna("Ordinary Shares Number")
+    piv["shares_pn"] = coluna("Preferred Shares Number")
+    total = coluna("Total Shares Number")
+    # sem o total explícito, soma as classes; sem elas, cai no Yahoo
+    piv["shares"] = total.fillna(
+        piv["shares_on"].fillna(0) + piv["shares_pn"].fillna(0)
+    ).replace(0, pd.NA).fillna(coluna("Share Issued"))
+
+    return piv[["ticker", "fiscal_date", "shares", "shares_on", "shares_pn"]]
 
 
 # ============================================================
@@ -188,90 +214,55 @@ def compute_piotroski_row(bs, bs1, inc, inc1, cf, ticker):
     return sum(1 for c in known if c) if known else None
 
 
-def _fatores_unit(precos, tickers):
-    """Quantas ações cada unit representa, inferido do PREÇO.
+def _market_cap(ticker, shares_map, precos):
+    """Valor de mercado da EMPRESA, somado por classe de ação.
 
-    ############################################################
-    # SOLUÇÃO TEMPORÁRIA - SUBSTITUIR QUANDO O FRE ENTRAR
-    #
-    # Esta função existe porque hoje só temos o TOTAL de ações da empresa,
-    # sem saber quantas são ON e quantas são PN. Sem essa separação, o único
-    # jeito de lidar com units é inferir o tamanho do pacote pela razão de
-    # preços - o que é aproximado e falha quando nenhuma classe individual
-    # negocia.
-    #
-    # O FRE (fre_cia_aberta_capital_social_AAAA.csv) traz a contagem POR
-    # CLASSE: Quantidade_Acoes_Ordinarias e Quantidade_Acoes_Preferenciais.
-    # Com isso, o valor de mercado passa a ser calculado direto e sem
-    # aproximação:
-    #
-    #     market_cap = (qtd_ON x preço_da_ON) + (qtd_PN x preço_da_PN)
-    #
-    # Isso é melhor por três motivos:
-    #   1. Elimina a inferência do fator da unit - some a fonte de erro.
-    #   2. Resolve as units sem classe de referência, que hoje ficam
-    #      superestimadas e apenas sinalizadas por aviso.
-    #   3. Corrige um erro que atinge TODAS as empresas com duas classes,
-    #      não só as units: hoje multiplicamos o total de ações por UM preço
-    #      só, ignorando que ON e PN negociam com preços diferentes (o
-    #      spread entre ITUB3 e ITUB4, por exemplo, é relevante).
-    #
-    # QUANDO IMPLEMENTAR: apagar esta função inteira e reescrever o cálculo
-    # de market_cap em build_metrics_snapshot.
-    ############################################################
+        market_cap = (qtd_ON x preço_da_ON) + (qtd_PN x preço_da_PN)
 
+    POR QUE ASSIM: multiplicar o total de ações por um preço só está errado
+    sempre que a empresa tem duas classes, porque ON e PN negociam a preços
+    diferentes (o spread entre ITUB3 e ITUB4 é relevante). E está muito errado
+    nas UNITS, onde o preço é de um pacote de várias ações enquanto a contagem
+    é individual - inflava o valor de mercado em 200-300%.
 
-    Uma unit é um pacote (ex: SANB11 = 1 ON + 1 PN; BPAC11 = 1 ON + 2 PN).
-    O preço negociado é do pacote inteiro, mas o balanço conta ações
-    individuais - então `preço x ações` infla o valor de mercado da empresa
-    pelo tamanho do pacote.
+    A versão anterior contornava isso inferindo o tamanho do pacote pela razão
+    entre preços, o que era aproximado e falhava quando nenhuma classe
+    individual negociava. Com o FRE trazendo ON e PN separados, a inferência
+    deixou de ser necessária.
 
-    Em vez de manter uma tabela fixa de composições (que envelhece a cada
-    reestruturação), inferimos o fator da razão entre o preço da unit e o
-    preço da ON da mesma empresa: se a unit vale 3x a ON, ela contém ~3
-    ações. É aproximado - PN e ON têm preços um pouco diferentes -, mas o
-    erro é de poucos por cento contra os 200-300% de não corrigir.
+    Quando falta preço de alguma classe, usa o preço disponível como
+    aproximação para ela - melhor que descartar a empresa inteira."""
+    dados = shares_map.get(ticker)
+    if not dados:
+        return None
+    prefixo = str(ticker).replace(".SA", "")[:4]
+    p_on = precos.get(f"{prefixo}3.SA")
+    p_pn = next((precos.get(f"{prefixo}{s}.SA") for s in ("4", "5", "6")
+                  if pd.notna(precos.get(f"{prefixo}{s}.SA"))), None)
 
-    Onde não existir a ON correspondente para comparar, o fator fica 1 e o
-    valor de mercado daquela unit segue superestimado - situação sinalizada
-    no retorno para quem quiser tratar."""
-    fatores, sem_referencia = {}, []
-    for tk in tickers:
-        base = str(tk).replace(".SA", "")
-        if not base.endswith("11"):
-            continue
-        prefixo = base[:4]
-        p_unit = precos.get(tk)
-        if p_unit is None or pd.isna(p_unit):
-            continue
+    n_on, n_pn = dados.get("shares_on"), dados.get("shares_pn")
+    tem_on = pd.notna(n_on) and n_on
+    tem_pn = pd.notna(n_pn) and n_pn
 
-        # Procura QUALQUER classe individual da mesma empresa como referência:
-        # ON (3), PN (4), PNA (5), PNB (6). Não basta olhar a ON - existem
-        # units compostas só de preferenciais (PN, ou PNA+PNB), sem nenhuma
-        # ordinária. E há empresas cuja ON existe mas não negocia, ficando
-        # sem preço no dia.
-        razao = None
-        for sufixo in ("3", "4", "5", "6"):
-            p_ref = precos.get(f"{prefixo}{sufixo}.SA")
-            if p_ref is None or pd.isna(p_ref) or p_ref <= 0:
-                continue
-            r = float(p_unit) / float(p_ref)
-            # units contêm tipicamente de 2 a 6 ações; fora dessa faixa é
-            # mais provável ser outra empresa com prefixo parecido
-            if 1.5 <= r <= 8:
-                razao = r
-                break
-        if razao is not None:
-            fatores[tk] = round(razao)
-        else:
-            sem_referencia.append(tk)
+    if tem_on or tem_pn:
+        # sem cotação de uma das classes, usa a da outra como aproximação
+        ref = p_on if pd.notna(p_on) else p_pn
+        if ref is None or pd.isna(ref):
+            return None
+        po = p_on if pd.notna(p_on) else ref
+        pp = p_pn if pd.notna(p_pn) else ref
+        total = (float(n_on) * float(po) if tem_on else 0.0) + \
+                (float(n_pn) * float(pp) if tem_pn else 0.0)
+        return total or None
 
-    if sem_referencia:
-        print(f"    aviso: {len(sem_referencia)} unit(s) sem classe individual para inferir "
-              f"a composição - valor de mercado delas fica SUPERESTIMADO: "
-              f"{', '.join(sorted(sem_referencia)[:8])}"
-              + (f" e mais {len(sem_referencia)-8}" if len(sem_referencia) > 8 else ""))
-    return fatores
+    # fallback: só o total de ações disponível
+    n = dados.get("shares")
+    if pd.isna(n) or not n:
+        return None
+    ref = p_on if pd.notna(p_on) else precos.get(ticker)
+    if ref is None or pd.isna(ref):
+        return None
+    return float(n) * float(ref)
 
 
 def build_metrics_snapshot(all_fin, as_of, prices_adj, shares_df, sectors):
@@ -296,22 +287,21 @@ def build_metrics_snapshot(all_fin, as_of, prices_adj, shares_df, sectors):
     shares_map = {}
     if not sh_avail.empty:
         latest = sh_avail.sort_values("fiscal_date").drop_duplicates("ticker", keep="last")
-        shares_map = dict(zip(latest["ticker"], latest["shares"]))
-
-    fator_unit = _fatores_unit(last_px, shares_map.keys())
+        # guarda as contagens POR CLASSE, não só o total - é o que permite
+        # somar o valor de mercado classe a classe em _market_cap
+        for _, r in latest.iterrows():
+            shares_map[r["ticker"]] = {
+                "shares": r.get("shares"),
+                "shares_on": r.get("shares_on"),
+                "shares_pn": r.get("shares_pn"),
+            }
 
     rows = []
     for ticker in bs.index:
         price = last_px.get(ticker)
         if price is None or pd.isna(price):
             continue
-        shares = shares_map.get(ticker)
-        # UNITS: o preço é de um pacote (ex: 1 ON + 2 PN), mas a contagem de
-        # ações do balanço é em ações INDIVIDUAIS. Multiplicar direto infla o
-        # valor de mercado pelo tamanho do pacote. Dividimos o preço pelo
-        # fator de composição para trazê-lo à base "por ação".
-        preco_por_acao = float(price) / fator_unit.get(ticker, 1.0)
-        market_cap = preco_por_acao * float(shares) if shares else None
+        market_cap = _market_cap(ticker, shares_map, last_px)
 
         book = g(bs, ticker, "Stockholders Equity", "Common Stock Equity")
         cash = g(bs, ticker, "Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments", default=0)
