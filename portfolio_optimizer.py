@@ -224,7 +224,7 @@ def _solve_max_return(mu, min_weight, max_weight):
     return dict(zip(mu.index, res.x))
 
 
-def solve_frontier(returns, risk_free_rate_annual=0.0, min_weight=0.0, max_weight=1.0,
+def solve_frontier(returns, risk_free_rate_annual=0.0, min_weight=0.5, max_weight=0.20,
                     n_frontier_points=DEFAULT_N_FRONTIER_POINTS, l2_gamma=0.0, mu_shrinkage=0.0,
                     covariance_method="ledoit_wolf"):
     """
