@@ -82,13 +82,24 @@ def mapa_cnpj_cd_cvm():
     return dict(zip(df[col_cnpj].astype(str).str.strip(), df[col_cd]))
 
 
+# Ticker da B3: exatamente 4 letras + 1 ou 2 dígitos (PETR3, BPAC11).
+RE_TICKER_VALIDO = re.compile(r"^[A-Z]{4}\d{1,2}$")
+
+
 def normalizar_ticker(t):
+    """Extrai um ticker válido, ou None.
+
+    O campo Codigo_Negociacao vem sujo: quando a empresa não preencheu, a CVM
+    grava zeros ("00000", "0"), códigos internos ("007424", "1545-8") ou o
+    próprio número do registro. Vimos "000000" no lugar de BPAC11 para o BTG.
+    Aceitar isso encheria a tabela de tickers inexistentes - e, pior, faria
+    parecer que temos cobertura histórica que não temos."""
     if not isinstance(t, str):
         return None
     t = t.strip().upper()
-    # o campo às vezes traz vários códigos separados por vírgula ou barra
     t = re.split(r"[,;/\s]+", t)[0]
-    return t or None
+    t = re.sub(r"[^A-Z0-9]", "", t)
+    return t if RE_TICKER_VALIDO.match(t) else None
 
 
 def montar(anos):
