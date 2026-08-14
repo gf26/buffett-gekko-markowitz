@@ -6,9 +6,10 @@ perde, isto aqui não.
 
 ---
 
-## 1. Valor de mercado por classe de ação (bloqueado: aguardando FRE)
+## 1. Valor de mercado por classe de ação (DESBLOQUEADO - FRE validado)
 
-**Estado:** solução temporária em produção.
+**Estado:** solução temporária ainda em produção, mas o dado necessário para
+substituí-la já foi validado e está sendo carregado.
 
 **O problema:** hoje temos só o TOTAL de ações da empresa, sem saber quantas
 são ON e quantas são PN. Isso causa dois erros:
@@ -43,10 +44,10 @@ Sem inferência, sem aproximação, e corrige também as empresas sem unit.
 
 ---
 
-## 2. Ações em circulação antes de 2020 (bloqueado: site da CVM fora do ar)
+## 2. Ações em circulação antes de 2020 (RESOLVIDO via FRE)
 
-**Estado:** sem dados. O backtest não consegue selecionar carteira em
-2010-2019.
+**Estado:** FRE baixado (2010-2025), layout e unidades verificados, ingestor
+escrito e alinhamento de exercício validado contra a Renner. ~12.900 linhas.
 
 **Por quê:** a CVM só publica `composicao_capital` a partir de 2020. Sem
 número de ações não há valor de mercado, e sem valor de mercado não existem
@@ -92,6 +93,26 @@ consistente. Resolve junto com o item 2.
 **Se o FRE não vier:** usar o LPA (conta 3.99.01) como árbitro de escala —
 onde `Lucro Líquido ÷ LPA` for ~1000x o valor do arquivo, multiplicar por
 1000.
+
+---
+
+## 3b. Buraco no exercício de 2022 (consequência da mudança de convenção)
+
+A CVM mudou a convenção da `Data_Referencia` do FRE entre os arquivos de 2022
+e 2023:
+
+- Até o arquivo 2022: referência em 1º de janeiro (= posição do fim do ano
+  ANTERIOR). O arquivo de 2022 descreve o fechamento de 2021.
+- A partir do arquivo 2023: referência em 31 de dezembro do próprio ano. O
+  arquivo de 2024 descreve o fechamento de 2024 (verificado: Renner com
+  1.059.549.692, idêntico à `composicao_capital` de 2024).
+
+Resultado: **ninguém descreve o fechamento de 2022** — o exercício fica com
+uma dezena de registros em vez de ~700.
+
+**Solução:** preencher 2022 com a `composicao_capital` (que cobre 2020-2025),
+usando o FRE de 2021 e 2023 como referência cruzada para conferir a escala
+daquele ano.
 
 ---
 
@@ -142,3 +163,62 @@ Localizado por descrição, cobertura incompleta. Afeta o FCF Yield.
 `compute_market_metrics.py` e `portfolio_optimizer.py` usam denominadores
 diferentes para o semi-desvio. Ambas as convenções são legítimas, mas os
 números não são comparáveis entre si. Padronizar.
+
+---
+
+## 9. Limite de espaço do Supabase — DECISÃO PENDENTE
+
+**Estado atual:** 424 MB de 500 MB usados (85%). Restam ~76 MB.
+
+**O que já está no limite:**
+
+| Objeto | Tamanho |
+|---|---|
+| `prices_daily` | 154 MB (1,17 mi de linhas) |
+| `financials` | ~112 MB + 46 MB de índice |
+| `prices_daily_pkey` | 44 MB |
+| `idx_prices_daily_date` | 15 MB — **usado 35 vezes, contra 1,2 mi do pkey** |
+
+**Cargas previstas:**
+
+- **FRE** (~12.900 linhas): ~2,5 MB. Cabe sem problema.
+- **COTAHIST da B3** (cotações históricas de tudo que negociou): este é o
+  problema. Traria preços diários de 800-1.200 tickers ao longo de 15+ anos —
+  estimados **3 a 4 milhões de linhas, ou 400-500 MB**. Não cabe, nem perto.
+
+**Por que o COTAHIST importa:** é o que resolve o viés de sobrevivência por
+completo (item 6) e o que habilita os 49 fatores do JKP que dependem só de
+preço diário (momentum, low risk, short-term reversal, seasonality, size —
+ver `RELATORIO_JKP.md`).
+
+### As três opções
+
+**A. Carregar só os tickers ausentes.** Os 336 identificados pelo
+`ticker_historico`. Estimativa: ~110 MB. Exige limpeza antes (ver abaixo) e
+ainda deixa pouca folga.
+
+**B. Frequência mensal para o universo histórico.** Fechamento mensal em vez
+de diário para os deslistados: ~5 MB. Resolve o viés de sobrevivência para
+backtest trimestral, mas **inviabiliza momentum, volatilidade e reversão** —
+ou seja, sacrifica justamente os fatores que o COTAHIST viabilizaria.
+
+**C. Upgrade do Supabase para o plano Pro** (8 GB). Custo da ordem de US$ 25
+por mês. Resolve de vez e não exige escolher entre profundidade e cobertura.
+
+**Recomendação registrada:** se o objetivo é pesquisa de fatores — e é —, a
+opção **C** é a mais coerente. A e B são adaptações a uma restrição que custa
+pouco para eliminar, e ambas sacrificam exatamente o que dá valor ao
+COTAHIST. Decisão do usuário, ainda não tomada.
+
+### Espaço recuperável sem custo (independente da decisão)
+
+1. **`idx_prices_daily_date`** (15 MB): 35 usos contra 1,2 milhão do índice de
+   chave primária. Candidato a `DROP INDEX`.
+2. **Preços anteriores a 2007** — o corte atual é 2005, feito para permitir
+   lookback de 5 anos. Cortar em 2007 devolveria alguns MB ao custo de
+   encurtar a janela dos primeiros rebalanceamentos.
+3. **Normalizar `line_item`, `statement` e `period_type`** para IDs numéricos.
+   Hoje cada linha repete strings longas ("Total Equity Gross Minority
+   Interest") no dado E no índice de 5 colunas. Reduziria drasticamente os
+   ~158 MB de `financials`. É invasivo (mexe em todo o código de leitura), mas
+   é o maior ganho disponível sem pagar nada.
