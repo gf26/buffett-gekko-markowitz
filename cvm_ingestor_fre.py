@@ -106,6 +106,19 @@ def mapa_cnpj_cd_cvm(anos):
     O FRE identifica empresas só por CNPJ; nossa `ticker_cvm_map` usa CD_CVM.
     Percorre vários anos porque uma empresa pode não estar em todos."""
     mapa = {}
+    # o cadastro traz TODAS as empresas já registradas, inclusive as que
+    # pararam de entregar DFP - cobre os poucos casos que os arquivos DFP
+    # sozinhos deixariam sem CD_CVM
+    cad = os.path.join(PASTA_CACHE, "cad_cia_aberta.csv")
+    if os.path.exists(cad):
+        d = pd.read_csv(cad, sep=";", encoding="latin-1", dtype=str)
+        c_cnpj = next((c for c in d.columns if "CNPJ" in c.upper()), None)
+        c_cd = next((c for c in d.columns if c.upper() in ("CD_CVM", "CODIGO_CVM")), None)
+        if c_cnpj and c_cd:
+            for cnpj, cd in zip(d[c_cnpj].astype(str).str.strip(),
+                                 d[c_cd].astype(str).str.strip().str.lstrip("0")):
+                mapa.setdefault(cnpj, cd)
+
     for ano in anos:
         try:
             zf = cvm_fonte.obter_dfp(ano, permitir_download=False)
@@ -136,13 +149,35 @@ def carregar_tickers(engine):
     return por_cd
 
 
+def fiscal_date_de(data_referencia, ano_arquivo):
+    """Exercício a que a posição de capital se refere.
+
+    O FRE do ano N NÃO descreve o fechamento de N. A Data_Referencia varia por
+    empresa (2021-01-01, 2021-02-28, 2021-05-01...) e indica a posição NAQUELE
+    momento. Verificado com a Petrobras: o FRE 2021 traz Data_Referencia
+    2021-01-01, ou seja, o fechamento de 2020.
+
+    Regra: o exercício é o último 31/12 anterior ou igual à data de
+    referência. Assim uma referência de janeiro/2021 vai para 2020-12-31, e
+    uma de dezembro/2021 vai para 2021-12-31 - sem precisar de regra fixa por
+    ano, que erraria dependendo do mês em que a empresa entregou."""
+    d = pd.to_datetime(data_referencia, errors="coerce")
+    if pd.isna(d):
+        # sem data de referência, assume o fechamento do ano anterior ao
+        # arquivo - o comportamento mais comum observado
+        return pd.Timestamp(year=ano_arquivo - 1, month=12, day=31).date()
+    ano_fiscal = d.year if (d.month == 12 and d.day == 31) else d.year - 1
+    return pd.Timestamp(year=ano_fiscal, month=12, day=31).date()
+
+
 def montar_linhas(df, cnpj_para_cd, cd_para_tickers, ano):
-    """Uma linha por (ticker, classe de ação). fiscal_date = 31/12 do ano do
-    arquivo: o FRE descreve a posição de capital do exercício de referência."""
-    fiscal_date = pd.Timestamp(year=ano, month=12, day=31).date()
+    """Uma linha por (ticker, classe de ação)."""
     linhas, sem_cd, sem_ticker = [], set(), set()
+    datas_usadas = {}
 
     for _, r in df.iterrows():
+        fiscal_date = fiscal_date_de(r.get("Data_Referencia"), ano)
+        datas_usadas[fiscal_date] = datas_usadas.get(fiscal_date, 0) + 1
         cnpj = str(r.get("CNPJ_Companhia", "")).strip()
         cd = cnpj_para_cd.get(cnpj)
         if not cd:
@@ -159,7 +194,7 @@ def montar_linhas(df, cnpj_para_cd, cd_para_tickers, ano):
             for tk in tickers:
                 linhas.append((tk, "balance_sheet", "annual", fiscal_date,
                                 line_item, float(valor), None, "cvm_fre"))
-    return linhas, sem_cd, sem_ticker
+    return linhas, sem_cd, sem_ticker, datas_usadas
 
 
 def gravar(engine, linhas, ano):
@@ -213,13 +248,16 @@ def main():
         df = ler_capital_social(ano)
         if df.empty:
             continue
-        linhas, sem_cd, sem_ticker = montar_linhas(df, cnpj_para_cd, cd_para_tickers, ano)
+        linhas, sem_cd, sem_ticker, datas = montar_linhas(df, cnpj_para_cd, cd_para_tickers, ano)
         n_tickers = len({l[0] for l in linhas})
-        print(f"  {ano}: {len(df):>5} empresas no FRE -> {len(linhas):>5} linhas, {n_tickers:>3} tickers"
-              f"  (sem CD_CVM: {len(sem_cd)}, sem ticker: {len(sem_ticker)})")
+        exercicios = ", ".join(f"{d.year}({n})" for d, n in sorted(datas.items()))
+        print(f"  arquivo {ano}: {len(df):>5} empresas -> {len(linhas):>5} linhas, {n_tickers:>3} tickers"
+              f"  (sem CD_CVM: {len(sem_cd)}, fora do universo: {len(sem_ticker)})")
+        print(f"              exercícios gravados: {exercicios}")
         resumo.append({"ano": ano, "empresas_fre": len(df), "tickers": n_tickers})
         if not args.dry_run:
-            gravar(engine, linhas, ano)
+            for fd in {l[3] for l in linhas}:
+                gravar(engine, [l for l in linhas if l[3] == fd], fd.year)
         total += len(linhas)
 
     print(f"\nTotal: {total} linhas" + (" (dry-run, nada gravado)" if args.dry_run else " gravadas"))
