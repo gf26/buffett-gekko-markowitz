@@ -149,6 +149,28 @@ def carregar_tickers(engine):
     return por_cd
 
 
+def qualidade_referencia(data_referencia):
+    """Quão direta é a associação entre a data de referência e o exercício.
+
+    Serve de desempate quando DOIS arquivos descrevem o mesmo exercício. Sem
+    isso, os poucos registros "atrasados" de um arquivo posterior (empresas
+    com referência no meio do ano) sobrescrevem os ~650 registros do arquivo
+    principal daquele exercício.
+
+      2 = referência em 31/12  -> é o próprio fechamento (convenção nova)
+      1 = referência em 01/01  -> fechamento do ano anterior (convenção antiga)
+      0 = referência no meio do ano -> exercício inferido, menos confiável
+    """
+    d = pd.to_datetime(data_referencia, errors="coerce")
+    if pd.isna(d):
+        return 0
+    if d.month == 12 and d.day == 31:
+        return 2
+    if d.month == 1 and d.day == 1:
+        return 1
+    return 0
+
+
 def fiscal_date_de(data_referencia, ano_arquivo):
     """Exercício a que a posição de capital se refere.
 
@@ -204,37 +226,38 @@ def montar_linhas(df, cnpj_para_cd, cd_para_tickers, ano):
             valor = r.get(col)
             if pd.isna(valor) or valor is None:
                 continue
+            q = qualidade_referencia(r.get("Data_Referencia"))
             for tk in tickers:
                 linhas.append((tk, "balance_sheet", "annual", fiscal_date,
-                                line_item, float(valor), None, "cvm_fre"))
+                                line_item, float(valor), None, "cvm_fre", q))
     return linhas, sem_cd, sem_ticker, datas_usadas
 
 
-def gravar(engine, linhas, ano):
+def gravar(engine, linhas):
     if not linhas:
         return 0
     # rede de segurança: garante chave única no lote, independentemente da
     # origem da duplicata. A chave é (ticker, statement, period_type,
     # fiscal_date, line_item) - posições 0,1,2,3,4 da tupla.
-    vistos, unicas = set(), []
+    # Um mesmo exercício pode ser descrito por DOIS arquivos. Fica o registro
+    # de melhor qualidade de referência (ver qualidade_referencia): o
+    # fechamento explícito vence o exercício inferido de uma data do meio do
+    # ano. Sem esse critério, 11 registros atrasados do arquivo de 2024
+    # substituiriam os 647 registros corretos do arquivo de 2023.
+    melhor = {}
     for l in linhas:
         k = (l[0], l[1], l[2], l[3], l[4])
-        if k in vistos:
-            continue
-        vistos.add(k)
-        unicas.append(l)
-    if len(unicas) < len(linhas):
-        print(f"    ({len(linhas) - len(unicas)} duplicatas descartadas antes de gravar)")
-    linhas = unicas
+        if k not in melhor or l[8] > melhor[k][8]:
+            melhor[k] = l
+    if len(melhor) < len(linhas):
+        print(f"  ({len(linhas) - len(melhor)} duplicatas resolvidas por qualidade da referência)")
+    linhas = [l[:8] for l in melhor.values()]
     conn = engine.raw_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute("""
-                DELETE FROM financials
-                WHERE source = 'cvm_fre' AND EXTRACT(YEAR FROM fiscal_date) = %s
-            """, (ano,))
+            cur.execute("DELETE FROM financials WHERE source = 'cvm_fre'")
             if cur.rowcount:
-                print(f"    (removidas {cur.rowcount} linhas anteriores de {ano})")
+                print(f"  (removidas {cur.rowcount} linhas de uma carga anterior)")
             execute_values(cur, """
                 INSERT INTO financials
                     (ticker, statement, period_type, fiscal_date, line_item, value, published_date, source)
@@ -269,7 +292,7 @@ def main():
         raise SystemExit("Não consegui montar o de-para CNPJ->CD_CVM. "
                           "Confira se os arquivos DFP estão em dados_cvm/.")
 
-    total, resumo = 0, []
+    total, resumo, todas_linhas = 0, [], []
     for ano in anos:
         df = ler_capital_social(ano)
         if df.empty:
@@ -281,12 +304,18 @@ def main():
               f"  (sem CD_CVM: {len(sem_cd)}, fora do universo: {len(sem_ticker)})")
         print(f"              exercícios gravados: {exercicios}")
         resumo.append({"ano": ano, "empresas_fre": len(df), "tickers": n_tickers})
-        if not args.dry_run:
-            for fd in {l[3] for l in linhas}:
-                gravar(engine, [l for l in linhas if l[3] == fd], fd.year)
+        todas_linhas.extend(linhas)
         total += len(linhas)
 
-    print(f"\nTotal: {total} linhas" + (" (dry-run, nada gravado)" if args.dry_run else " gravadas"))
+    # grava TUDO de uma vez. Gravar arquivo a arquivo com DELETE por exercício
+    # fazia um arquivo posterior apagar o que o arquivo principal daquele
+    # exercício já tinha escrito - foi assim que os exercícios 2022, 2023 e
+    # 2024 ficaram com 5 tickers em vez de ~320.
+    if not args.dry_run and todas_linhas:
+        gravos = gravar(engine, todas_linhas)
+        print(f"\n{gravos} linhas gravadas.")
+
+    print(f"\nTotal processado: {total} linhas" + (" (dry-run, nada gravado)" if args.dry_run else ""))
 
     if resumo:
         r = pd.DataFrame(resumo)
