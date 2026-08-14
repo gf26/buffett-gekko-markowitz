@@ -205,9 +205,24 @@ def montar_linhas(df, cnpj_para_cd, cd_para_tickers, ano):
     # mais recente, que é a informação mais atualizada daquele exercício.
     df = df.copy()
     df["_fiscal_date"] = [fiscal_date_de(d, ano) for d in df.get("Data_Referencia", [None] * len(df))]
-    ordem = [c for c in ["Versao", "Data_Referencia"] if c in df.columns]
-    if ordem:
-        df = df.sort_values(ordem)
+
+    # CRITÉRIO DE DESEMPATE: Data_Autorizacao_Aprovacao, a mais recente.
+    #
+    # O arquivo traz o HISTÓRICO de aprovações de capital da empresa - várias
+    # linhas com a MESMA versão e a MESMA data de referência, diferindo apenas
+    # na data em que aquele capital foi aprovado. A CEG, por exemplo, aparece
+    # com aprovações de 2013 a 2018: 51.927.546.473 ações até 2015 e
+    # 259.637.732 a partir de 2016, depois de um grupamento.
+    #
+    # Ordenar por Versao (idêntica em todas) fazia o desempate cair numa linha
+    # arbitrária - e no caso da CEG pegava o número pré-grupamento, 200x maior
+    # que o correto.
+    if "Data_Autorizacao_Aprovacao" in df.columns:
+        df["_aprovacao"] = pd.to_datetime(df["Data_Autorizacao_Aprovacao"], errors="coerce")
+    else:
+        df["_aprovacao"] = pd.NaT
+    ordem = ["_aprovacao"] + [c for c in ["Versao", "Data_Referencia"] if c in df.columns]
+    df = df.sort_values(ordem, na_position="first")
     df = df.drop_duplicates(["CNPJ_Companhia", "_fiscal_date"], keep="last")
 
     for _, r in df.iterrows():
@@ -311,6 +326,30 @@ def main():
     # fazia um arquivo posterior apagar o que o arquivo principal daquele
     # exercício já tinha escrito - foi assim que os exercícios 2022, 2023 e
     # 2024 ficaram com 5 tickers em vez de ~320.
+    # ---- sanidade: variação implausível entre exercícios consecutivos ----
+    # Uma empresa pode desdobrar ou grupar ações, mas saltos de ordem de
+    # grandeza costumam indicar dado errado - foi assim que a CEG apareceu com
+    # 51,9 bilhões de ações (número pré-grupamento) em vez de 259 milhões.
+    if todas_linhas:
+        chk = pd.DataFrame([(l[0], l[3], l[4], l[5]) for l in todas_linhas
+                            if l[4] == "Total Shares Number"],
+                           columns=["ticker", "fiscal_date", "line_item", "valor"])
+        chk = chk.sort_values(["ticker", "fiscal_date"])
+        chk["anterior"] = chk.groupby("ticker")["valor"].shift(1)
+        chk["razao"] = chk["valor"] / chk["anterior"].replace(0, pd.NA)
+        susp = chk[(chk["razao"].notna()) & ((chk["razao"] > 10) | (chk["razao"] < 0.1))]
+        if not susp.empty:
+            print(f"\n  ATENÇÃO: {len(susp)} variação(ões) acima de 10x entre exercícios")
+            print("  consecutivos. Desdobramento/grupamento explica algumas; o resto")
+            print("  merece conferência na fonte:")
+            for _, r in susp.nlargest(min(12, len(susp)), "razao").iterrows():
+                print(f"    {r['ticker']:<11} {r['fiscal_date']}  "
+                      f"{r['anterior']:>16,.0f} -> {r['valor']:>16,.0f}  ({r['razao']:>8.1f}x)")
+            menores = susp[susp["razao"] < 0.1]
+            for _, r in menores.nsmallest(min(6, len(menores)), "razao").iterrows():
+                print(f"    {r['ticker']:<11} {r['fiscal_date']}  "
+                      f"{r['anterior']:>16,.0f} -> {r['valor']:>16,.0f}  ({r['razao']:>8.4f}x)")
+
     if not args.dry_run and todas_linhas:
         gravos = gravar(engine, todas_linhas)
         print(f"\n{gravos} linhas gravadas.")
