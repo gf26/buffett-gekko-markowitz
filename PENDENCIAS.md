@@ -6,10 +6,11 @@ perde, isto aqui não.
 
 ---
 
-## 1. Valor de mercado por classe de ação (DESBLOQUEADO - FRE validado)
+## 1. Valor de mercado por classe de ação — 🔜 PRÓXIMA AÇÃO
 
-**Estado:** solução temporária ainda em produção, mas o dado necessário para
-substituí-la já foi validado e está sendo carregado.
+**Estado:** o dado necessário está no banco (item 2 concluído). Falta
+reescrever o cálculo no `scoring.py`. É o caminho crítico: até isso ser feito,
+o backtest continua rodando com valor de mercado incorreto.
 
 **O problema:** hoje temos só o TOTAL de ações da empresa, sem saber quantas
 são ON e quantas são PN. Isso causa dois erros:
@@ -44,10 +45,20 @@ Sem inferência, sem aproximação, e corrige também as empresas sem unit.
 
 ---
 
-## 2. Ações em circulação antes de 2020 (RESOLVIDO via FRE)
+## 2. Ações em circulação antes de 2020 — ✅ CONCLUÍDO
 
-**Estado:** FRE baixado (2010-2025), layout e unidades verificados, ingestor
-escrito e alinhamento de exercício validado contra a Renner. ~12.900 linhas.
+**Estado:** carregado. 13.674 linhas, 339 tickers, exercícios de 2009 a 2025,
+em `source = 'cvm_fre'`, com contagem separada de ordinárias e preferenciais.
+
+**Como ficou:** o `capital_social` do FRE não traz "a posição do exercício" —
+traz o HISTÓRICO DE APROVAÇÕES DE CAPITAL, uma linha por aprovação, com sua
+`Data_Autorizacao_Aprovacao`. O ingestor acumula as aprovações de todos os
+arquivos e, para cada exercício, aplica a que estava vigente em 31/12. Isso
+torna o dado point-in-time e independente de qual arquivo foi lido.
+
+Descoberto porque a CEG oscilava entre 259 milhões e 51,9 bilhões de ações
+conforme o exercício: são os números pré e pós-grupamento de 2016, e a versão
+anterior escolhia entre eles de forma arbitrária.
 
 **Por quê:** a CVM só publica `composicao_capital` a partir de 2020. Sem
 número de ações não há valor de mercado, e sem valor de mercado não existem
@@ -76,7 +87,25 @@ conferindo com a realidade de 2013).
 
 ---
 
-## 3. Escala inconsistente em `composicao_capital` (2020-2025)
+## 3. Escala inconsistente em `composicao_capital` — ✅ RESOLVIDO (fonte descartada)
+
+**Confirmado com dado:** comparando `composicao_capital` com o FRE no exercício
+de 2024 — 201 empresas (62%) em unidades, 96 (30%) em milhares, 26 (8%) em
+outra situação. Não há coluna que indique a unidade usada, então não há
+correção confiável possível.
+
+**Ação tomada:** as três contagens de ações vindas de `source = 'cvm'` foram
+apagadas. O FRE é a fonte única.
+
+**Efeito colateral aceito:** 12 tickers ficaram sem contagem (BAZA3, BDLL3/4,
+BMGB4, HETA4, HOOT4, ITUB3/4, LWSA3, SHOW3, TIMS3, VBBR3). Itaú, TIM e Vibra
+faltarem no FRE é implausível — vale investigar se usam outro `Tipo_Capital`
+ou se o CNPJ não está casando. **NÃO** recuperar via `composicao_capital`:
+seria trocar "sem dado" por "dado errado em 38% dos casos".
+
+---
+
+## 3-bis. Registro histórico: o problema original de escala
 
 **Estado:** dados carregados estão errados para parte das empresas.
 
@@ -96,7 +125,14 @@ onde `Lucro Líquido ÷ LPA` for ~1000x o valor do arquivo, multiplicar por
 
 ---
 
-## 3b. Buraco no exercício de 2022 (consequência da mudança de convenção)
+## 3b. Buraco no exercício de 2022 — ✅ RESOLVIDO
+
+Resolvido de graça pela mudança para lógica point-in-time (item 2): como a
+posição vem da aprovação vigente e não da data de referência do documento,
+2022 passou a ter 331 tickers. A explicação do problema fica abaixo por ser
+útil se algo parecido reaparecer.
+
+### O que era
 
 A CVM mudou a convenção da `Data_Referencia` do FRE entre os arquivos de 2022
 e 2023:
@@ -222,3 +258,37 @@ COTAHIST. Decisão do usuário, ainda não tomada.
    Interest") no dado E no índice de 5 colunas. Reduziria drasticamente os
    ~158 MB de `financials`. É invasivo (mexe em todo o código de leitura), mas
    é o maior ganho disponível sem pagar nada.
+
+---
+
+## 10. Variações implausíveis na contagem de ações (69 casos)
+
+A verificação de sanidade do `cvm_ingestor_fre.py` sinaliza 69 variações
+acima de 10x entre exercícios consecutivos. **A maioria é real** — aumento de
+capital, IPO e incorporação produzem saltos assim:
+
+- PRIO3 (50,6x em 2013): a Petro Rio nasceu da HRT, reestruturação pesada
+- VAMO3 (41,3x em 2021): IPO; antes era subsidiária de capital fechado
+- OSXB3 (95,9x em 2012): captação, seguida de recuperação judicial
+- EQPA3 (29,9x em 2013): incorporação
+
+**Três são suspeitos e compartilham a mesma assinatura** — um valor
+absurdamente pequeno no exercício anterior:
+
+| Ticker | Exercício | De | Para |
+|---|---|---|---|
+| RVEE3 | 2025 | **1.000** | 80.094.177 |
+| LPSB3 | 2012 | **64.000** | 57.078.658 |
+| TECN3 | 2013 | **268.565** | 77.478.413 |
+
+Mil ações é número de empresa recém-constituída, não de listada. A hipótese é
+que seja a primeira aprovação de capital da empresa — de quando ainda era
+fechada — sendo aplicada a um exercício em que ela já negociava.
+
+**Correção sugerida (não implementada):** piso de sanidade descartando
+posições abaixo de ~100 mil ações, implausível para empresa listada. Pegaria
+os três sem afetar os casos legítimos.
+
+**Prioridade:** baixa. São 3 tickers em 339, e o efeito é valor de mercado
+subestimado neles — o que os faria parecer baratos no screener. Vale corrigir
+antes de confiar em qualquer resultado que os inclua.
