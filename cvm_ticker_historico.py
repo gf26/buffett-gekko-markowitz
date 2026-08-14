@@ -142,6 +142,13 @@ def consolidar(bruto, cnpj_para_cd):
     d["cnpj"] = d[c_cnpj].astype(str).str.strip()
     d["cd_cvm"] = d["cnpj"].map(cnpj_para_cd)
 
+    # as colunas de data vêm como TEXTO misturado com NaN (float). O min/max
+    # do groupby tenta comparar str com float e quebra. Converter antes
+    # resolve e ainda normaliza formatos diferentes entre anos.
+    for c in (c_ini, c_fim):
+        if c:
+            d[c] = pd.to_datetime(d[c], errors="coerce")
+
     agg = d.groupby(["cnpj", "ticker"], as_index=False).agg(
         cd_cvm=("cd_cvm", "first"),
         nome=(c_nome, "last") if c_nome else ("ticker", "first"),
