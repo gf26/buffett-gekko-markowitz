@@ -336,7 +336,10 @@ def main():
                            columns=["ticker", "fiscal_date", "line_item", "valor"])
         chk = chk.sort_values(["ticker", "fiscal_date"])
         chk["anterior"] = chk.groupby("ticker")["valor"].shift(1)
-        chk["razao"] = chk["valor"] / chk["anterior"].replace(0, pd.NA)
+        # to_numeric é necessário: replace(0, pd.NA) devolve coluna object,
+        # e nlargest/nsmallest não funcionam nesse dtype
+        chk["razao"] = pd.to_numeric(
+            chk["valor"] / chk["anterior"].replace(0, pd.NA), errors="coerce")
         susp = chk[(chk["razao"].notna()) & ((chk["razao"] > 10) | (chk["razao"] < 0.1))]
         if not susp.empty:
             print(f"\n  ATENÇÃO: {len(susp)} variação(ões) acima de 10x entre exercícios")
