@@ -62,6 +62,9 @@ warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
 PASTA_CACHE = "dados_cvm"
 TIPO_CAPITAL = "Capital Integralizado"
 
+# ver comentário em consolidar_aprovacoes
+PISO_ACOES = 100_000
+
 COLUNAS = {
     "Quantidade_Acoes_Ordinarias": "Ordinary Shares Number",
     "Quantidade_Acoes_Preferenciais": "Preferred Shares Number",
@@ -110,6 +113,34 @@ def consolidar_aprovacoes(anos):
     todas = todas[todas["Quantidade_Total_Acoes"].fillna(0) > 0]
     if antes - len(todas):
         print(f"\n  {antes - len(todas)} aprovações descartadas por quantidade zero/ausente")
+
+    # PISO DE SANIDADE: empresa listada não tem 1.000 ações.
+    #
+    # Três casos apareceram com a mesma assinatura - um valor absurdamente
+    # pequeno num exercício em que a empresa já negociava:
+    #     RVEE3  1.000 -> 80.094.177
+    #     LPSB3  64.000 -> 57.078.658
+    #     TECN3  268.565 -> 77.478.413
+    # É a primeira aprovação de capital da empresa, de quando ainda era
+    # fechada, sendo aplicada a um exercício posterior. Não é escala (não é
+    # 1000x exato) nem desdobramento: é aprovação antiga fora de contexto.
+    #
+    # O piso é conservador DE PROPÓSITO: 100 mil pega RVEE3 (1.000) e LPSB3
+    # (64.000), mas NÃO pega TECN3 (268.565). Subir para 1 milhão pegaria a
+    # TECN3 e passaria a arriscar descartar empresas pequenas legítimas -
+    # trocar um falso positivo por falsos negativos é piorar o problema.
+    # A TECN3 e casos semelhantes ficam por conta da verificação de variação
+    # entre exercícios (checar_sanidade), que os sinaliza sem descartar.
+    antes = len(todas)
+    pequenas = todas[todas["Quantidade_Total_Acoes"] < PISO_ACOES]
+    if not pequenas.empty:
+        print(f"  {len(pequenas)} aprovações descartadas por quantidade abaixo de "
+              f"{PISO_ACOES:,} ações (implausível para empresa listada):")
+        amostra = (pequenas.groupby("Nome_Companhia")["Quantidade_Total_Acoes"]
+                            .agg(["min", "count"]).nsmallest(8, "min"))
+        for nome, r in amostra.iterrows():
+            print(f"      {str(nome)[:45]:<47} menor: {r['min']:>12,.0f}  ({int(r['count'])} aprovações)")
+    todas = todas[todas["Quantidade_Total_Acoes"] >= PISO_ACOES]
 
     todas["_aprovacao"] = pd.to_datetime(todas.get("Data_Autorizacao_Aprovacao"), errors="coerce")
     sem_data = int(todas["_aprovacao"].isna().sum())
