@@ -97,11 +97,22 @@ correção confiável possível.
 **Ação tomada:** as três contagens de ações vindas de `source = 'cvm'` foram
 apagadas. O FRE é a fonte única.
 
-**Efeito colateral aceito:** 12 tickers ficaram sem contagem (BAZA3, BDLL3/4,
-BMGB4, HETA4, HOOT4, ITUB3/4, LWSA3, SHOW3, TIMS3, VBBR3). Itaú, TIM e Vibra
-faltarem no FRE é implausível — vale investigar se usam outro `Tipo_Capital`
-ou se o CNPJ não está casando. **NÃO** recuperar via `composicao_capital`:
-seria trocar "sem dado" por "dado errado em 38% dos casos".
+**Efeito colateral RESOLVIDO:** os 12 tickers que ficaram sem contagem
+(BAZA3, BDLL3/4, BMGB4, HETA4, HOOT4, ITUB3/4, LWSA3, SHOW3, TIMS3, VBBR3)
+foram recuperados. Eram duas causas distintas:
+
+1. **Bug no mapeamento CNPJ → CD_CVM.** Um mesmo CNPJ tem dois registros na
+   CVM, um CANCELADO (antigo) e um ATIVO. O cadastro lista o cancelado
+   primeiro e o código pegava "o primeiro que aparece" — o Itaú ia para o
+   código 1279 em vez do 19348, e como 1279 não está na `ticker_cvm_map`,
+   caía silenciosamente em "fora do universo". Mesmo padrão em Vibra
+   (14249 × 24295) e BMG (1716 × 24600). Corrigido: o registro ATIVO vence.
+
+2. **Ausência de `Capital Integralizado`.** TIM e Bardella só declaram
+   "Capital Emitido"; Banco da Amazônia só "Capital Subscrito". Resolvido com
+   cascata — ver item 12.
+
+Cobertura foi de 339 para **350 tickers**.
 
 ---
 
@@ -292,3 +303,146 @@ os três sem afetar os casos legítimos.
 **Prioridade:** baixa. São 3 tickers em 339, e o efeito é valor de mercado
 subestimado neles — o que os faria parecer baratos no screener. Vale corrigir
 antes de confiar em qualquer resultado que os inclua.
+
+---
+
+## 11. Fonte de preços: Yahoo, COTAHIST ou brapi — DECISÃO PENDENTE
+
+**Situação atual:** todos os preços vêm do Yahoo (1,17 mi de linhas em
+`prices_daily`). Os fundamentos vêm da CVM. As linhas do Yahoo em
+`financials` são resíduo de 2021+ mais campos que a CVM não cobre.
+
+### O problema com o Yahoo
+
+Erros recorrentes, cada um descoberto por depuração:
+
+| Erro | Evidência |
+|---|---|
+| Moeda errada | Vale e Embraer em USD rotulados como BRL (razão ~6,19); `financialCurrency` não é confiável |
+| Histórico curto | ~3-4 períodos de fundamentos; limite duro da API, Premium não resolve |
+| Remove deslistados | APER3, HGTX3, BIDI11 desaparecem — causa direta do viés de sobrevivência |
+| Ajuste de proventos quebrado | AZEV3 cotada a R$ 0,0001 por 740 pregões, saltando para R$ 302,82; OSXB3 idem. Um caso levou o 1/N a reportar 10.292.549% de retorno |
+
+### Alternativa A: COTAHIST (B3) para histórico + Yahoo/brapi para recente
+
+**A favor:** é a fonte PRIMÁRIA, vem da própria bolsa, é imutável e contém
+tudo que negociou — inclusive deslistados. Resolve o viés de sobrevivência e
+habilita os 49 fatores do JKP que dependem de preço diário.
+
+**Contra:** traz preços SEM ajuste por proventos e desdobramentos. O ajuste
+teria que ser feito com as tabelas `dividends` e `splits`.
+
+**Confiabilidade do ajuste próprio — avaliação honesta:**
+
+- *Splits e grupamentos:* alta confiabilidade. É aritmética simples, e a
+  tabela `splits` já existe desde 2000.
+- *Dividendos e JCP:* média. A fórmula padrão (fator = 1 − provento/preço na
+  data-com) é bem estabelecida, mas depende da tabela `dividends` estar
+  completa e com as datas certas. Lacunas produzem degraus na série.
+- *Bonificações, subscrições, incorporações:* baixa. São os casos que mais
+  quebram, e são justamente os que o Yahoo também erra.
+
+**O ponto a favor mesmo assim:** o ajuste passa a ser auditável e sob seu
+controle, em vez de uma caixa-preta que às vezes devolve R$ 0,0001. Erros
+viram bugs que dá para investigar, não mistérios da fonte.
+
+**Validação possível:** comparar a série ajustada por nós com a da brapi (ou
+com o Yahoo, onde ele não está quebrado) para tickers líquidos. Concordância
+alta valida a metodologia; divergência aponta onde o ajuste falha. Essa
+comparação sozinha já justifica um mês de plano pago da brapi.
+
+### Alternativa B: brapi
+
+**A favor:** menos manutenção, sem parsing, sem descobrir variantes de plano
+de contas. Custo comparável ao do Supabase Pro.
+
+**A verificar antes de decidir (nenhum destes foi confirmado):**
+1. Mantém histórico de DESLISTADOS? Se não, o viés de sobrevivência continua
+   e a vantagem principal do COTAHIST se perde.
+2. Cobre 2010 nos fundamentos?
+3. Fornece DATA DE PUBLICAÇÃO? Sua base tem `published_date` real da CVM em
+   100% dos fundamentos. APIs comerciais costumam entregar o valor corrigido,
+   não o que estava público na data — o que introduz look-ahead invisível.
+4. Os preços são ajustados? Por qual metodologia?
+
+### Arquitetura: consultar a API ou gravar no banco?
+
+**Gravar no banco, sempre.** Consultar a API a cada operação seria inviável:
+
+- O backtest reconstrói o ranking para 56+ datas, cada uma exigindo
+  fundamentos de ~300 empresas e preços de 15 anos. Seriam dezenas de
+  milhares de chamadas por execução.
+- Cada execução consumiria cota e levaria minutos em vez de segundos.
+- Sem cache local, backtests deixam de ser reproduzíveis — a fonte pode
+  revisar dados entre duas execuções.
+
+O padrão correto é o que já existe: **ingestão periódica grava no banco, os
+scripts leem do banco.** Trocar de fonte muda o script de ingestão, não a
+arquitetura.
+
+### Consumo estimado de cota
+
+Com ingestão diária (o padrão atual) e ~350 tickers:
+
+| Uso | Chamadas/mês |
+|---|---|
+| Cotações diárias, 350 tickers, 21 pregões | ~7.350 |
+| Fundamentos, atualização trimestral | ~1.400 |
+| **Total recorrente** | **~9.000** |
+
+O **plano gratuito (15.000/mês) provavelmente basta** para o uso recorrente —
+desde que a carga histórica inicial venha do COTAHIST, não da API. O gargalo
+do plano gratuito não é o volume: é que fundamentos e `range=max` são
+bloqueados por plano, não por cota (verificado: HTTP 403 nos módulos
+`balanceSheetHistory` e `incomeStatementHistory`).
+
+### Recomendação registrada
+
+**Híbrido:** COTAHIST para o histórico (2010-2024) e brapi para o incremento
+corrente, substituindo o Yahoo. Isso ataca o viés de sobrevivência com a
+fonte primária e elimina a peça mais problemática do pipeline atual.
+
+Antes de assinar qualquer coisa, testar os 4 pontos da Alternativa B — se a
+brapi não tiver deslistados nem data de publicação, ela substitui o Yahoo mas
+não substitui a CVM nem o COTAHIST.
+
+---
+
+## 12. Cascata de tipos de capital — implementada, com ressalva
+
+**O que é:** o FRE declara o capital em quatro tipos. O ingestor usa, nesta
+ordem de preferência:
+
+1. `Capital Integralizado` — efetivamente pago. É o correto.
+2. `Capital Subscrito` — comprometido pelos sócios, podendo haver parcela a
+   integralizar.
+3. `Capital Emitido` — autorizado a emitir.
+
+`Capital Autorizado` fica **fora** de propósito: é teto estatutário, não ações
+existentes (a Vale tem 5,37 bi integralizados contra 10,8 bi autorizados).
+
+**Por que a cascata existe:** exigir só Integralizado deixava TIM, Bardella e
+Banco da Amazônia sem contagem nenhuma.
+
+**A ressalva, e ela é maior do que se previa:** 329 empresas (526 aprovações
+de 5.536, ~9,5%) não têm Integralizado e usam Subscrito ou Emitido. Esperava-se
+3 empresas.
+
+A maioria são securitizadoras e veículos financeiros fora do universo, mas há
+empresas reais na lista (Algar Telecom, Aegea, Aliansce). Onde há capital
+subscrito e não integralizado, a contagem **superestima** as ações em
+circulação — e portanto o valor de mercado, fazendo a empresa parecer mais
+cara do que é.
+
+**Rastreabilidade:** o tipo usado é impresso no log da execução, mas **não
+gravado no banco** — a tabela `financials` não tem coluna para isso. Se a
+auditoria por ticker virar necessária, seria preciso uma coluna nova ou uma
+tabela auxiliar.
+
+**Como saber quais dos seus tickers estão afetados:** ver o comando de
+diagnóstico registrado junto a este item na conversa; ele cruza os arquivos
+FRE com a `ticker_cvm_map`.
+
+**Prioridade:** média. Não bloqueia nada, mas convém saber quais tickers do
+universo ativo dependem de tipo não-integralizado antes de confiar no
+valuation deles.
