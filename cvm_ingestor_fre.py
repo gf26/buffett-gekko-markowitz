@@ -60,7 +60,22 @@ from sqlalchemy import create_engine, text
 warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
 
 PASTA_CACHE = "dados_cvm"
-TIPO_CAPITAL = "Capital Integralizado"
+# CASCATA DE TIPOS DE CAPITAL, em ordem de preferência.
+#
+# "Integralizado" é o capital efetivamente pago - é o que queremos. Mas TIM e
+# Bardella só declaram "Emitido", e o Banco da Amazônia só "Subscrito"; exigir
+# Integralizado deixava essas empresas sem contagem de ações.
+#
+# Os três costumam coincidir (a Vibra tem 1.119.000.000 nos três). Divergem
+# quando há capital subscrito e ainda não integralizado - aí Subscrito e
+# Emitido SUPERESTIMAM as ações em circulação, e portanto o valor de mercado.
+#
+# "Capital Autorizado" fica FORA de propósito: é teto estatutário, não ações
+# existentes. A Vale tem 5,37 bi integralizados contra 10,8 bi autorizados.
+#
+# O tipo efetivamente usado é gravado em `tipo_capital` para auditoria - se
+# um dia quiser restringir só aos integralizados, dá para filtrar.
+CASCATA_CAPITAL = ["Capital Integralizado", "Capital Subscrito", "Capital Emitido"]
 
 # ver comentário em consolidar_aprovacoes
 PISO_ACOES = 100_000
@@ -84,7 +99,7 @@ def ler_capital_social(ano):
         df = pd.read_csv(f, sep=";", encoding="latin-1", dtype=str)
     if "Tipo_Capital" not in df.columns:
         return pd.DataFrame()
-    df = df[df["Tipo_Capital"] == TIPO_CAPITAL].copy()
+    df = df[df["Tipo_Capital"].isin(CASCATA_CAPITAL)].copy()
     df["_ano_arquivo"] = ano
     return df
 
@@ -148,10 +163,29 @@ def consolidar_aprovacoes(anos):
         print(f"  {sem_data} aprovações sem data - descartadas (não dá para datar o valor)")
     todas = todas.dropna(subset=["_aprovacao"])
 
+    # aplica a cascata: para cada (empresa, aprovação), fica o tipo de maior
+    # preferência disponível
+    todas["_pref"] = todas["Tipo_Capital"].map({t: i for i, t in enumerate(CASCATA_CAPITAL)})
     if "Versao" in todas.columns:
         todas["Versao"] = pd.to_numeric(todas["Versao"], errors="coerce")
-        todas = todas.sort_values(["_ano_arquivo", "Versao"])
+        todas = todas.sort_values(["_pref", "_ano_arquivo", "Versao"],
+                                   ascending=[False, True, True])
+    else:
+        todas = todas.sort_values("_pref", ascending=False)
     todas = todas.drop_duplicates(["CNPJ_Companhia", "_aprovacao"], keep="last")
+
+    usados = todas["Tipo_Capital"].value_counts()
+    if len(usados) > 1:
+        print("\n  Tipos de capital utilizados (cascata):")
+        for t, n in usados.items():
+            print(f"    {t:<26} {n:>6} aprovações")
+        nao_integ = todas[todas["Tipo_Capital"] != "Capital Integralizado"]
+        if not nao_integ.empty:
+            emp = sorted(nao_integ["Nome_Companhia"].dropna().unique())[:8]
+            print(f"  {nao_integ['CNPJ_Companhia'].nunique()} empresas sem 'Capital Integralizado' "
+                  f"- contagem pode estar superestimada:")
+            for e in emp:
+                print(f"      {str(e)[:60]}")
 
     print(f"\n  {len(todas)} aprovações distintas, {todas['CNPJ_Companhia'].nunique()} empresas")
     return todas.sort_values(["CNPJ_Companhia", "_aprovacao"])
@@ -176,6 +210,7 @@ def posicao_por_exercicio(aprovacoes, de, ate):
                 "cnpj": cnpj,
                 "fiscal_date": corte.date(),
                 "aprovacao": r["_aprovacao"].date(),
+                "tipo_capital": r.get("Tipo_Capital"),
                 **{col: r.get(col) for col in COLUNAS},
             })
     return pd.DataFrame(linhas)
@@ -188,10 +223,21 @@ def mapa_cnpj_cd_cvm(anos):
         d = pd.read_csv(cad, sep=";", encoding="latin-1", dtype=str)
         c_cnpj = next((c for c in d.columns if "CNPJ" in c.upper()), None)
         c_cd = next((c for c in d.columns if c.upper() in ("CD_CVM", "CODIGO_CVM")), None)
+        c_sit = next((c for c in d.columns if c.upper() == "SIT"), None)
         if c_cnpj and c_cd:
+            # UM CNPJ PODE TER DOIS REGISTROS NA CVM: um CANCELADO (antigo) e
+            # um ATIVO. O cadastro lista o cancelado primeiro, então pegar "o
+            # primeiro que aparece" mapeava o Itaú para o código 1279 em vez
+            # do 19348 - e como 1279 não está na ticker_cvm_map, o Itaú caía
+            # silenciosamente em "fora do universo", sem contagem de ações.
+            # Mesmo padrão em Vibra (14249 x 24295) e BMG (1716 x 24600).
+            if c_sit:
+                d = d.copy()
+                d["_ativo"] = d[c_sit].astype(str).str.strip().str.upper().eq("ATIVO")
+                d = d.sort_values("_ativo")   # ativos por último -> vencem
             for cnpj, cd in zip(d[c_cnpj].astype(str).str.strip(),
                                  d[c_cd].astype(str).str.strip().str.lstrip("0")):
-                mapa.setdefault(cnpj, cd)
+                mapa[cnpj] = cd   # sem setdefault: o último (ATIVO) prevalece
     for ano in anos:
         caminho = os.path.join(PASTA_CACHE, f"dfp_cia_aberta_{ano}.zip")
         if not os.path.exists(caminho):
@@ -203,6 +249,7 @@ def mapa_cnpj_cd_cvm(anos):
         with zf.open(nome) as f:
             d = pd.read_csv(f, sep=";", encoding="latin-1", dtype={"CNPJ_CIA": str, "CD_CVM": str})
         if "CNPJ_CIA" in d.columns and "CD_CVM" in d.columns:
+            # complemento: só preenche CNPJ que o cadastro não trouxe
             for cnpj, cd in zip(d["CNPJ_CIA"].astype(str).str.strip(),
                                  d["CD_CVM"].astype(str).str.strip().str.lstrip("0")):
                 mapa.setdefault(cnpj, cd)
