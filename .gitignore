@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 brapi_catalogo.json
 selic_historica.csv
+backtest_carteiras.csv
