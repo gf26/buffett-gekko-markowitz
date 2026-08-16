@@ -52,6 +52,59 @@ BCB_SELIC_META_SERIES = 432  # Meta Selic definida pelo Copom, % a.a. - api.bcb.
 IBOVESPA_TICKER = "^BVSP"
 
 
+def fetch_selic_historica(inicio, fim, cache="selic_historica.csv"):
+    """Série histórica da Selic meta (% a.a.) entre duas datas.
+
+    POR QUE ISTO EXISTE: o backtest usava uma taxa livre de risco CONSTANTE
+    (14,25%) para os 56 períodos. A Selic foi de ~2% em 2020 a 14,25% em 2025 -
+    aplicar 14,25% a 2020 faz a otimização de máximo Sharpe exigir retorno
+    esperado acima de 14,25% num ano em que o CDI rendia 2%. Quase nenhum
+    ativo qualifica, e o otimizador falha com "at least one of the assets must
+    have an expected return exceeding the risk-free rate", caindo para peso
+    igual. Foram 7 rebalanceamentos assim numa das variantes testadas - ou
+    seja, a curva "Markowitz" era híbrida sem que isso ficasse explícito.
+
+    Devolve uma Series indexada por data, em decimal (0.1425 = 14,25% a.a.).
+
+    O CACHE existe porque um backtest não deve depender de rede a cada
+    execução: se a API estiver fora do ar, o resultado mudaria silenciosamente
+    (cairia no fallback constante), tornando execuções não comparáveis."""
+    if cache and os.path.exists(cache):
+        s = pd.read_csv(cache, parse_dates=["data"]).set_index("data")["taxa"]
+        if not s.empty and s.index.min() <= pd.Timestamp(inicio) and s.index.max() >= pd.Timestamp(fim):
+            return s
+
+    url = (f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{BCB_SELIC_META_SERIES}/dados"
+           f"?formato=json&dataInicial={pd.Timestamp(inicio).strftime('%d/%m/%Y')}"
+           f"&dataFinal={pd.Timestamp(fim).strftime('%d/%m/%Y')}")
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        d = pd.DataFrame(resp.json())
+        d["data"] = pd.to_datetime(d["data"], format="%d/%m/%Y")
+        d["taxa"] = pd.to_numeric(d["valor"], errors="coerce") / 100
+        s = d.dropna(subset=["taxa"]).set_index("data")["taxa"].sort_index()
+        if cache:
+            s.rename("taxa").to_frame().to_csv(cache)
+        print(f"  Selic histórica: {len(s)} observações, "
+              f"de {s.min()*100:.2f}% a {s.max()*100:.2f}% a.a.")
+        return s
+    except Exception as e:
+        print(f"  Aviso: não consegui buscar a Selic histórica ({e}).")
+        return pd.Series(dtype=float)
+
+
+def selic_na_data(serie, data, fallback):
+    """Selic vigente numa data - a última observação até ela.
+
+    Usa a última anterior, não a mais próxima, para não olhar o futuro: numa
+    data de rebalanceamento só se conhece a taxa já divulgada."""
+    if serie is None or serie.empty:
+        return fallback
+    ate = serie[serie.index <= pd.Timestamp(data)]
+    return float(ate.iloc[-1]) if not ate.empty else fallback
+
+
 def fetch_selic_rate_anual(default=0.0):
     """Busca a Selic meta atual (% ao ano) via API pública do Banco Central
     (SGS, série 432) e devolve como decimal (ex: 0.15 para 15% a.a.). Se a
