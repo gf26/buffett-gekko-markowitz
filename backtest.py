@@ -247,6 +247,11 @@ def run_backtest(engine, args):
             history[name].append({
                 "date": rebal_date, "next_date": next_date, "n_assets": len(w),
                 "return_pct": ret * 100, "cost_pct": cost * 100, "equity": equity[name],
+                # guarda a composição: é o que permite exportar a carteira de
+                # cada data e responder "quais ativos apareceram mais?",
+                # "a carteira gira muito?", "as duas estratégias escolhem os
+                # mesmos ativos?" - perguntas que os números agregados escondem
+                "weights": dict(w),
             })
             prev_weights[name] = drifted
 
@@ -419,6 +424,79 @@ def parse_args():
     return p.parse_args()
 
 
+ARQUIVO_CARTEIRAS = "backtest_carteiras.csv"
+
+
+def exportar_carteiras(history, arquivo=ARQUIVO_CARTEIRAS):
+    """Grava a composição de cada carteira, em cada rebalanceamento.
+
+    POR QUE: os números agregados (Sharpe, CAGR) escondem o que a estratégia
+    de fato fez. Com a composição em mãos dá para responder quais ativos
+    apareceram mais, se a carteira gira muito, e se as duas estratégias
+    escolhem os mesmos papéis - nesta configuração escolhem, já que a seleção
+    vem do screener e só a regra de peso difere. Ver isso explícito ajuda a
+    entender de onde vem a diferença de resultado entre elas."""
+    linhas = []
+    for estrategia, registros in history.items():
+        for r in registros:
+            for ticker, peso in (r.get("weights") or {}).items():
+                linhas.append({
+                    "estrategia": estrategia,
+                    "data": pd.Timestamp(r["date"]).date(),
+                    "ticker": ticker,
+                    "peso_pct": round(float(peso) * 100, 2),
+                    "retorno_periodo_pct": round(r["return_pct"], 2),
+                })
+    if not linhas:
+        return
+    df = pd.DataFrame(linhas).sort_values(["estrategia", "data", "peso_pct"],
+                                           ascending=[True, True, False])
+    df.to_csv(arquivo, index=False, encoding="utf-8-sig")
+
+    print("\n" + "=" * 78)
+    print("COMPOSIÇÃO DAS CARTEIRAS")
+    print("=" * 78)
+    print(f"Detalhe completo em: {arquivo} ({len(df)} linhas)\n")
+
+    # os ativos que mais apareceram, na estratégia otimizada
+    principal = "markowitz" if "markowitz" in history else list(history)[0]
+    d = df[df["estrategia"] == principal]
+    n_datas = d["data"].nunique()
+    freq = (d.groupby("ticker")
+              .agg(periodos=("data", "nunique"), peso_medio=("peso_pct", "mean"))
+              .sort_values("periodos", ascending=False))
+    freq["pct_periodos"] = (freq["periodos"] / n_datas * 100).round(0)
+    print(f"Ativos mais frequentes ({principal}, {n_datas} rebalanceamentos):")
+    print(freq.head(15).to_string())
+    print(f"\n{len(freq)} ativos distintos passaram pela carteira ao longo do período.")
+
+    # giro: quanto da carteira muda de um rebalanceamento para o outro
+    datas = sorted(d["data"].unique())
+    trocas = []
+    for i in range(1, len(datas)):
+        ant = set(d[d["data"] == datas[i - 1]]["ticker"])
+        atual = set(d[d["data"] == datas[i]]["ticker"])
+        if ant:
+            trocas.append(len(atual - ant) / len(atual) * 100)
+    if trocas:
+        print(f"\nGiro médio: {sum(trocas)/len(trocas):.0f}% dos ativos trocados "
+              f"a cada rebalanceamento (mín {min(trocas):.0f}%, máx {max(trocas):.0f}%).")
+
+    # as duas estratégias escolhem os mesmos ativos?
+    if len(history) > 1:
+        outra = [k for k in history if k != principal][0]
+        d2 = df[df["estrategia"] == outra]
+        iguais = 0
+        for dt in datas:
+            a = set(d[d["data"] == dt]["ticker"])
+            b = set(d2[d2["data"] == dt]["ticker"])
+            if a and a == b:
+                iguais += 1
+        print(f"\n'{principal}' e '{outra}' selecionaram os MESMOS ativos em "
+              f"{iguais} de {len(datas)} rebalanceamentos"
+              + (" - a diferença entre elas é só a regra de peso." if iguais == len(datas) else "."))
+
+
 def main():
     args = parse_args()
     if args.piotroski_min == 0:
@@ -472,6 +550,8 @@ def main():
 
     path = plot_backtest({name: anchor_curve(df) for name, df in curves.items()})
     print(f"\nGráfico salvo em: {path}")
+
+    exportar_carteiras(history)
 
     print("\n" + "!" * 78)
     print("LEIA ANTES DE INTERPRETAR:")
