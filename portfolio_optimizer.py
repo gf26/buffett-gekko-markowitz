@@ -71,27 +71,57 @@ def fetch_selic_historica(inicio, fim, cache="selic_historica.csv"):
     (cairia no fallback constante), tornando execuções não comparáveis."""
     if cache and os.path.exists(cache):
         s = pd.read_csv(cache, parse_dates=["data"]).set_index("data")["taxa"]
-        if not s.empty and s.index.min() <= pd.Timestamp(inicio) and s.index.max() >= pd.Timestamp(fim):
+        # só aceita o cache se ele COBRE o período pedido. Um cache parcial
+        # (de uma execução em que alguns anos falharam) seria pior que nenhum:
+        # o backtest usaria o fallback fixo nos anos faltantes sem avisar.
+        limite = min(pd.Timestamp(fim), pd.Timestamp.today().normalize())
+        if (not s.empty and s.index.min() <= pd.Timestamp(inicio)
+                and s.index.max() >= limite - pd.DateOffset(months=1)):
+            print(f"  Selic histórica: {len(s)} observações (cache), "
+                  f"de {s.min()*100:.2f}% a {s.max()*100:.2f}% a.a.")
             return s
 
-    url = (f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{BCB_SELIC_META_SERIES}/dados"
-           f"?formato=json&dataInicial={pd.Timestamp(inicio).strftime('%d/%m/%Y')}"
-           f"&dataFinal={pd.Timestamp(fim).strftime('%d/%m/%Y')}")
-    try:
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        d = pd.DataFrame(resp.json())
-        d["data"] = pd.to_datetime(d["data"], format="%d/%m/%Y")
-        d["taxa"] = pd.to_numeric(d["valor"], errors="coerce") / 100
-        s = d.dropna(subset=["taxa"]).set_index("data")["taxa"].sort_index()
-        if cache:
-            s.rename("taxa").to_frame().to_csv(cache)
-        print(f"  Selic histórica: {len(s)} observações, "
-              f"de {s.min()*100:.2f}% a {s.max()*100:.2f}% a.a.")
-        return s
-    except Exception as e:
-        print(f"  Aviso: não consegui buscar a Selic histórica ({e}).")
+    # A API do BCB LIMITA O TAMANHO DO INTERVALO por requisição. A série 432 é
+    # diária; pedir 16 anos de uma vez (~5.900 pontos) devolve HTTP 406, sem
+    # mensagem explicando. Um ano por vez funciona. Testado:
+    #     intervalo de 2020 inteiro  -> 200
+    #     intervalo de 2010 a 2026   -> 406
+    base = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{BCB_SELIC_META_SERIES}/dados"
+    partes, falhas = [], 0
+    ini, fim_ts = pd.Timestamp(inicio), pd.Timestamp(fim)
+    # não pede além de hoje: datas futuras não têm observação
+    fim_ts = min(fim_ts, pd.Timestamp.today().normalize())
+
+    ano = ini.year
+    while ano <= fim_ts.year:
+        d0 = max(ini, pd.Timestamp(year=ano, month=1, day=1))
+        d1 = min(fim_ts, pd.Timestamp(year=ano, month=12, day=31))
+        url = (f"{base}?formato=json"
+               f"&dataInicial={d0.strftime('%d/%m/%Y')}&dataFinal={d1.strftime('%d/%m/%Y')}")
+        try:
+            resp = requests.get(url, timeout=30)
+            resp.raise_for_status()
+            dados = resp.json()
+            if dados:
+                partes.append(pd.DataFrame(dados))
+        except Exception:
+            falhas += 1
+        ano += 1
+
+    if not partes:
+        print(f"  Aviso: não consegui buscar a Selic histórica ({falhas} anos falharam).")
         return pd.Series(dtype=float)
+
+    d = pd.concat(partes, ignore_index=True)
+    d["data"] = pd.to_datetime(d["data"], format="%d/%m/%Y")
+    d["taxa"] = pd.to_numeric(d["valor"], errors="coerce") / 100
+    s = d.dropna(subset=["taxa"]).drop_duplicates("data").set_index("data")["taxa"].sort_index()
+    if cache:
+        s.rename("taxa").to_frame().to_csv(cache)
+    aviso = f"  ({falhas} anos falharam)" if falhas else ""
+    print(f"  Selic histórica: {len(s)} observações de {s.index.min().date()} a "
+          f"{s.index.max().date()}, variando de {s.min()*100:.2f}% a {s.max()*100:.2f}% a.a.{aviso}")
+    return s
 
 
 def selic_na_data(serie, data, fallback):
