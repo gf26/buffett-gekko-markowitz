@@ -49,6 +49,7 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 
 import scoring
+import portfolio_optimizer as po
 from portfolio_optimizer import _annualized_mu_sigma, _shrink_mu
 
 TRADING_DAYS_PER_YEAR = 252
@@ -188,7 +189,13 @@ def run_backtest(engine, args):
     strategies = {"markowitz": {}, "equal": {}}
     history = {k: [] for k in strategies}
     prev_weights = {k: {} for k in strategies}
-    equity = {k: 1.0 for k in strategies}
+    equity = {k: 1.0 for k in strategies}    # série histórica da Selic, buscada uma vez e cacheada em disco
+    selic_hist = po.fetch_selic_historica(rebal_dates[0], rebal_dates[-1])
+    if selic_hist.empty:
+        print(f"  (usando taxa livre de risco fixa de {args.risk_free_rate}% a.a. - "
+              f"série histórica indisponível)")
+
+
 
     for i, rebal_date in enumerate(dates[:-1]):
         next_date = dates[i + 1]
@@ -219,9 +226,15 @@ def run_backtest(engine, args):
         print(f"  {rebal_date.date()}: {len(selected)} ativos selecionados "
               f"({excluded_short} excluídos por histórico curto)")
 
+        # Selic VIGENTE nesta data, não uma taxa fixa para os 14 anos. Usar
+        # 14,25% em 2020 (quando a Selic era 2%) fazia a otimização de máximo
+        # Sharpe exigir retorno esperado acima de 14,25% - quase nada
+        # qualificava, e o rebalanceamento caía para peso igual sem que a
+        # curva "Markowitz" deixasse isso explícito.
+        rf = po.selic_na_data(selic_hist, rebal_date, args.risk_free_rate / 100)
         for name in strategies:
             w = optimize_weights(returns_window, selected, name, args.min_weight / 100,
-                                  args.max_weight / 100, args.risk_free_rate / 100,
+                                  args.max_weight / 100, rf,
                                   args.mu_shrinkage, args.l2_gamma)
             if not w:
                 continue
