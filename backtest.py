@@ -91,14 +91,14 @@ def nearest_trading_day(prices_index, target):
 
 
 def optimize_weights(returns_window, tickers, method, min_weight, max_weight,
-                      risk_free_rate, mu_shrinkage, l2_gamma, fallback="equal"):
+                      risk_free_rate, mu_shrinkage, l2_gamma, fallback="minvar"):
     """Pesos para a carteira selecionada. Usa SÓ dados da janela anterior ao
     rebalanceamento - nunca do futuro.
 
     O parâmetro `fallback` define o que fazer quando a otimização falha:
 
-      equal  - peso igual entre os selecionados (comportamento histórico).
-      minvar - mínima variância. Usa SÓ a matriz de covariância, ignorando o
+      equal  - peso igual entre os selecionados.
+      minvar - PADRÃO. Mínima variância: usa SÓ a matriz de covariância, ignorando o
                retorno esperado. É a resposta padrão da literatura para a
                falha "nenhum ativo com retorno acima da taxa livre de risco",
                porque ataca a causa (estimativa de mu ruidosa) em vez do
@@ -481,9 +481,12 @@ def parse_args():
     p.add_argument("--min-history-days", type=int, default=DEFAULT_MIN_HISTORY_DAYS)
     p.add_argument("--risk-free-rate", type=float, default=14.25,
                     help="Fallback caso a série histórica da Selic não seja obtida.")
-    p.add_argument("--fallback", choices=["equal", "minvar", "cash"], default="equal",
-                    help="O que fazer quando a otimização falha: peso igual (padrão), "
-                         "mínima variância, ou 100%% em caixa rendendo a Selic.")
+    p.add_argument("--fallback", choices=["equal", "minvar", "cash"], default="minvar",
+                    help="O que fazer quando a otimização falha. minvar (padrão): mínima "
+                         "variância, que usa só a covariância e não depende da estimativa "
+                         "de retorno - se ela também falhar, cai para peso igual. "
+                         "equal: peso igual direto. cash: 100%% em caixa rendendo a Selic "
+                         "(ver ressalva na docstring de optimize_weights).")
     p.add_argument("--mu-shrinkage", type=float, default=0.0)
     p.add_argument("--l2-gamma", type=float, default=0.0)
     return p.parse_args()
