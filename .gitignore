@@ -5,3 +5,4 @@ dados_cvm/
 __pycache__/
 *.pyc
 brapi_catalogo.json
+selic_historica.csv
