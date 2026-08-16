@@ -174,7 +174,10 @@ def run_backtest(engine, args):
         raise SystemExit("Sem dados suficientes no banco. Rode os scripts de ingestão primeiro.")
 
     first_available = all_fin["available_from"].min()
-    start = max(pd.Timestamp(first_available), pd.Timestamp(prices_adj.index.min()) + pd.Timedelta(days=365))
+    # DateOffset em vez de Timedelta(days=365): o NumPy novo avisa sobre
+    # conversão implícita de inteiro para timedelta genérico
+    start = max(pd.Timestamp(first_available),
+                pd.Timestamp(prices_adj.index.min()) + pd.DateOffset(years=1))
     end = prices_adj.index.max()
     dates = [d for d in rebalance_dates(start, end, frequency=args.rebalance_freq)]
     dates = [nearest_trading_day(prices_adj.index, d) for d in dates]
@@ -189,13 +192,13 @@ def run_backtest(engine, args):
     strategies = {"markowitz": {}, "equal": {}}
     history = {k: [] for k in strategies}
     prev_weights = {k: {} for k in strategies}
-    equity = {k: 1.0 for k in strategies}    # série histórica da Selic, buscada uma vez e cacheada em disco
-    selic_hist = po.fetch_selic_historica(rebal_dates[0], rebal_dates[-1])
+    equity = {k: 1.0 for k in strategies}
+
+    # série histórica da Selic, buscada uma vez e cacheada em disco
+    selic_hist = po.fetch_selic_historica(dates[0], dates[-1])
     if selic_hist.empty:
         print(f"  (usando taxa livre de risco fixa de {args.risk_free_rate}% a.a. - "
               f"série histórica indisponível)")
-
-
 
     for i, rebal_date in enumerate(dates[:-1]):
         next_date = dates[i + 1]
