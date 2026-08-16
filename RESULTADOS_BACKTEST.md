@@ -13,40 +13,84 @@ lookback 756 dias, 56 períodos (2012-06 a 2026-03).
 
 ## Variantes testadas
 
-| # | Parâmetros alterados | Retorno | CAGR | Vol | **Sharpe** | Sortino | Max DD | Custo |
-|---|---|---|---|---|---|---|---|---|
-| 1 | padrão (min 2% / max 35%) | 298,13% | 10,37% | 26,65% | **0,389** | 0,665 | −43,25% | 6,85% |
-| 2 | min 5% / max 20% | 393,28% | 12,07% | 23,31% | **0,518** | 0,961 | −34,52% | 6,08% |
-| 3 | min 5% / max 20% + mu-shrinkage 0,5 | 398,94% | 12,17% | 22,90% | **0,531** | 0,982 | −34,07% | 6,13% |
+### Rodada 1 — com taxa livre de risco FIXA (14,25%) — ⚠️ DESCARTADA
 
-Linhas de referência (não dependem desses parâmetros, então são idênticas nas
-três variantes):
+Estas três foram medidas antes de descobrirmos que a taxa era constante para
+os 14 anos. Ficam registradas só para contar quantas variantes foram testadas.
+
+| # | Parâmetros | Sharpe |
+|---|---|---|
+| 1 | min 2% / max 35% | 0,389 |
+| 2 | min 5% / max 20% | 0,518 |
+| 3 | min 5% / max 20% + mu-shrinkage 0,5 | 0,531 |
+
+### Rodada 2 — com Selic histórica (2,00% a 15,00%)
+
+Todas com `min-weight 5`, `max-weight 20`, `mu-shrinkage 0.5`. Muda só o que
+fazer quando a otimização falha (9 dos 56 rebalanceamentos).
+
+| # | Fallback | Retorno | CAGR | Vol | **Sharpe** | Sortino | Max DD | Custo |
+|---|---|---|---|---|---|---|---|---|
+| 4 | equal | 412,87% | 12,39% | 22,64% | 0,547 | 1,029 | −34,49% | 6,12% |
+| 5 | **minvar** (adotado) | 425,88% | 12,59% | 22,64% | **0,556** | 1,083 | −30,91% | 6,15% |
+| 6 | cash | 481,27% | 13,40% | 20,86% | **0,642** | 1,300 | −27,83% | 6,01% |
+
+Referências (não dependem desses parâmetros):
 
 | Referência | Retorno | CAGR | Vol | Sharpe | Sortino | Max DD |
 |---|---|---|---|---|---|---|
-| Estratégia (peso igual) | 375,05% | 11,77% | 21,91% | 0,537 | 1,030 | −32,12% |
+| Estratégia (peso igual) | 363,87% | 11,58% | 20,96% | 0,553 | 1,028 | −32,35% |
 | 1/N do universo | 366,88% | 11,63% | 22,78% | 0,511 | 0,958 | −32,78% |
 | Ibovespa | 222,45% | 8,72% | 19,10% | 0,457 | 0,845 | −27,84% |
 
+**Total: 6 variantes testadas.**
+
 ---
 
-## Leitura
+## Por que `cash` venceu e mesmo assim não foi adotado
 
-**Restringir os pesos foi o que mais mudou.** Sharpe de 0,389 para 0,518 só
-com a faixa de 2-35% indo para 5-20%, e o drawdown melhorou 9 pontos. Confirma
-a hipótese de que o problema do Markowitz aqui era concentração — soluções de
-canto empurrando peso para os extremos com base em estimativas ruidosas.
+O fallback `cash` teve o melhor resultado em todas as métricas — inclusive
+drawdown menor que o do próprio Ibovespa. Ainda assim, `minvar` foi adotado.
 
-**O mu-shrinkage acrescentou pouco** (0,518 → 0,531). O ganho marginal sugere
-que a restrição de peso já capturava a maior parte do efeito.
+**São 9 decisões, e 7 concentradas em 2015-2016.** Toda a vantagem vem de
+estar em caixa naquela janela: a bolsa caiu forte em 2015 e a Selic estava em
+14,25%, então caixa rendia 3,4% ao trimestre enquanto o mercado caía. Não é
+uma regra testada 56 vezes — é essencialmente **uma aposta que deu certo**,
+repetida em trimestres consecutivos do mesmo evento.
 
-**Mesmo na melhor variante, o Markowitz não supera o peso igual** em Sharpe
-(0,531 contra 0,537) nem em Sortino (0,982 contra 1,030), e ainda paga 6,13%
-de custo contra 5,27%. Em retorno bruto ele ganha (398,94% contra 375,05%),
-mas ajustado a risco e a custo, não.
+**O gatilho não é previsão, é consequência mecânica.** A otimização falha
+quando a média dos últimos 756 pregões cai abaixo da Selic. Com juros a 14,25%
+e três anos de bolsa fraca para trás, isso acontecia automaticamente. O
+critério não previu a queda — reagiu a ela.
 
-**Nenhuma variante bate o 1/N de forma convincente.** Peso igual 0,537 contra
-1/N 0,511 é uma diferença pequena — e o 1/N não paga os 5,27% de custo.
+**Os 2 casos de 2024 mostram o outro lado.** Ali a falha foi `infeasible`
+(numérica, não econômica) e ir para caixa não tinha justificativa alguma.
+Aconteceu mesmo assim.
+
+**Muda a natureza do que está sendo testado.** Com `cash`, as duas estratégias
+passaram a divergir em 9 dos 56 períodos — antes selecionavam exatamente os
+mesmos ativos em todos. Deixou de ser regra de peso e virou decisão de
+alocação entre bolsa e renda fixa, sem que os dois efeitos possam ser
+separados.
+
+**Para testar `cash` de verdade** seria preciso um gatilho explícito (não o
+subproduto de uma falha numérica) e um período com mais de um ciclo de alta de
+juros.
+
+---
+
+## Composição das carteiras (variante 5)
+
+- **86 ativos distintos** passaram pela carteira em 56 rebalanceamentos.
+- **Mais frequentes:** VLID3 (43% dos períodos), UNIP6 (41%), VIVT3 e LEVE3
+  (30%), UGPA3 (29%), TOTS3 (27%).
+- **Giro médio: 28%** dos ativos trocados por rebalanceamento (mín 0%, máx
+  100%) — relacionado direto aos ~6,15% de custo acumulado.
+- **Markowitz e peso igual selecionaram os MESMOS ativos em 56 de 56**
+  rebalanceamentos. A seleção vem do screener; a diferença entre as duas é
+  exclusivamente a regra de peso.
+
+Detalhe completo em `backtest_carteiras.csv`.
 
 ---
 
