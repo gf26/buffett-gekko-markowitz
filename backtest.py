@@ -91,9 +91,32 @@ def nearest_trading_day(prices_index, target):
 
 
 def optimize_weights(returns_window, tickers, method, min_weight, max_weight,
-                      risk_free_rate, mu_shrinkage, l2_gamma):
+                      risk_free_rate, mu_shrinkage, l2_gamma, fallback="equal"):
     """Pesos para a carteira selecionada. Usa SÓ dados da janela anterior ao
-    rebalanceamento - nunca do futuro."""
+    rebalanceamento - nunca do futuro.
+
+    O parâmetro `fallback` define o que fazer quando a otimização falha:
+
+      equal  - peso igual entre os selecionados (comportamento histórico).
+      minvar - mínima variância. Usa SÓ a matriz de covariância, ignorando o
+               retorno esperado. É a resposta padrão da literatura para a
+               falha "nenhum ativo com retorno acima da taxa livre de risco",
+               porque ataca a causa (estimativa de mu ruidosa) em vez do
+               sintoma, e mantém a carteira investida.
+      cash   - 100% no ativo livre de risco, rendendo a Selic do período.
+               Logicamente coerente com o que a otimização está dizendo, mas
+               veja a ressalva abaixo.
+
+    RESSALVA SOBRE 'cash': o "retorno esperado" aqui é a média dos últimos 756
+    pregões. Concluir "nada vai bater a Selic" a partir disso é previsão
+    fraca - e repare QUANDO isso acontece: os casos observados são de
+    2015-2016, logo após uma queda forte. Sair para caixa ali significaria
+    perder a recuperação de 2016-2017. O critério tende a mandar para caixa
+    DEPOIS das quedas, que é quando os retornos futuros costumam ser maiores.
+    Além disso, muda a pergunta que o backtest responde: deixa de ser "o
+    screener seleciona bem?" e passa a incluir market timing, sem separar os
+    dois efeitos.
+    """
     available = [t for t in tickers if t in returns_window.columns]
     if len(available) < 2:
         return None
@@ -118,9 +141,36 @@ def optimize_weights(returns_window, tickers, method, min_weight, max_weight,
         ef.max_sharpe(risk_free_rate=risk_free_rate)
         return {t: w for t, w in ef.clean_weights().items() if w > 0}
     except (OptimizationError, ValueError) as e:
-        print(f"      otimização falhou ({e}) - usando peso igual neste rebalanceamento")
-        w = 1.0 / len(available)
-        return {t: w for t in available}
+        return _aplicar_fallback(fallback, available, mu, S, min_weight, max_weight,
+                                  l2_gamma, str(e))
+
+
+CAIXA = "__CAIXA__"
+
+
+def _aplicar_fallback(fallback, available, mu, S, min_weight, max_weight, l2_gamma, erro):
+    from pypfopt import EfficientFrontier, objective_functions
+    from pypfopt.exceptions import OptimizationError
+
+    if fallback == "minvar":
+        try:
+            ef = EfficientFrontier(mu, S, weight_bounds=(min_weight, max_weight))
+            if l2_gamma > 0:
+                ef.add_objective(objective_functions.L2_reg, gamma=l2_gamma)
+            ef.min_volatility()
+            print(f"      otimização falhou ({erro[:60]}) - usando mínima variância")
+            return {t: w for t, w in ef.clean_weights().items() if w > 0}
+        except (OptimizationError, ValueError):
+            print(f"      otimização e mínima variância falharam - usando peso igual")
+
+    elif fallback == "cash":
+        print(f"      otimização falhou ({erro[:60]}) - indo 100% para caixa (Selic)")
+        return {CAIXA: 1.0}
+
+    w = 1.0 / len(available)
+    if fallback != "minvar":
+        print(f"      otimização falhou ({erro[:60]}) - usando peso igual")
+    return {t: w for t in available}
 
 
 def turnover_cost(prev_weights, new_weights, cost_pct):
@@ -131,13 +181,23 @@ def turnover_cost(prev_weights, new_weights, cost_pct):
     return turnover * cost_pct / 100
 
 
-def period_return(prices_adj, weights, start, end):
-    """Retorno simples da carteira entre dois pregões, com pesos fixos."""
+def period_return(prices_adj, weights, start, end, taxa_caixa=None):
+    """Retorno simples da carteira entre dois pregões, com pesos fixos.
+
+    A posição em caixa (ticker CAIXA, criada pelo fallback 'cash') rende a
+    Selic anual informada, proporcional ao número de dias corridos."""
     if not weights:
         return 0.0, {}
     window = prices_adj.loc[start:end]
     if len(window) < 2:
         return 0.0, weights
+
+    if CAIXA in weights:
+        dias = max((pd.Timestamp(end) - pd.Timestamp(start)).days, 1)
+        r = (1 + (taxa_caixa or 0.0)) ** (dias / 365) - 1
+        peso_caixa = weights[CAIXA]
+        if peso_caixa >= 0.999:
+            return r, dict(weights)
 
     total, drifted = 0.0, {}
     for t, w in weights.items():
@@ -238,11 +298,12 @@ def run_backtest(engine, args):
         for name in strategies:
             w = optimize_weights(returns_window, selected, name, args.min_weight / 100,
                                   args.max_weight / 100, rf,
-                                  args.mu_shrinkage, args.l2_gamma)
+                                  args.mu_shrinkage, args.l2_gamma,
+                                  fallback=args.fallback)
             if not w:
                 continue
             cost = turnover_cost(prev_weights[name], w, args.cost_pct)
-            ret, drifted = period_return(prices_adj, w, rebal_date, next_date)
+            ret, drifted = period_return(prices_adj, w, rebal_date, next_date, taxa_caixa=rf)
             equity[name] *= (1 - cost) * (1 + ret)
             history[name].append({
                 "date": rebal_date, "next_date": next_date, "n_assets": len(w),
@@ -418,7 +479,11 @@ def parse_args():
     p.add_argument("--max-weight", type=float, default=35.0)
     p.add_argument("--lookback-days", type=int, default=756)
     p.add_argument("--min-history-days", type=int, default=DEFAULT_MIN_HISTORY_DAYS)
-    p.add_argument("--risk-free-rate", type=float, default=14.25)
+    p.add_argument("--risk-free-rate", type=float, default=14.25,
+                    help="Fallback caso a série histórica da Selic não seja obtida.")
+    p.add_argument("--fallback", choices=["equal", "minvar", "cash"], default="equal",
+                    help="O que fazer quando a otimização falha: peso igual (padrão), "
+                         "mínima variância, ou 100%% em caixa rendendo a Selic.")
     p.add_argument("--mu-shrinkage", type=float, default=0.0)
     p.add_argument("--l2-gamma", type=float, default=0.0)
     return p.parse_args()
