@@ -61,6 +61,9 @@ warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
 
 PASTA = "dados_cvm"
 
+# ver comentário em carregar_acoes_por_classe
+PISO_ACOES = 100_000
+
 # Espécie no FRE -> sufixo do ticker na B3
 ESPECIE_PARA_CLASSE = {
     "ORDINÁRIA": "ON",
@@ -177,8 +180,24 @@ def carregar_acoes_por_classe(anos):
         t[c] = pd.to_numeric(t.get(c), errors="coerce")
     t["_aprovacao"] = pd.to_datetime(t.get("Data_Autorizacao_Aprovacao"), errors="coerce")
     t = t.dropna(subset=["_aprovacao"])
-    t = t[(t["Quantidade_Acoes_Ordinarias"].fillna(0)
-           + t["Quantidade_Acoes_Preferenciais"].fillna(0)) > 0]
+    total_acoes = (t["Quantidade_Acoes_Ordinarias"].fillna(0)
+                   + t["Quantidade_Acoes_Preferenciais"].fillna(0))
+
+    # PISO DE SANIDADE - o mesmo do cvm_ingestor_fre.py.
+    #
+    # O arquivo traz o histórico de aprovações de capital, incluindo as de
+    # quando a empresa ainda era fechada. A LPSB3 tem uma aprovação com 64.000
+    # ações; dividir R$ 36,2 milhões de dividendo por ela dá R$ 565 por ação -
+    # foi o que produziu razão de 2.485x contra o Yahoo na validação.
+    #
+    # Empresa listada não tem menos de 100 mil ações. O piso é conservador:
+    # descarta a aprovação implausível sem eliminar empresas pequenas
+    # legítimas, cujas contagens estão na casa dos milhões.
+    antes = len(t)
+    t = t[total_acoes >= PISO_ACOES]
+    if antes - len(t):
+        print(f"  {antes - len(t)} aprovações descartadas por total abaixo de "
+              f"{PISO_ACOES:,} ações (implausível para empresa listada)")
 
     pref = {"Capital Integralizado": 2, "Capital Subscrito": 1, "Capital Emitido": 0}
     t["_pref"] = t["Tipo_Capital"].map(pref)
