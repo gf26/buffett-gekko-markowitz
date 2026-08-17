@@ -129,8 +129,28 @@ def carregar_dividendos(anos):
     if "Versao" in t.columns:
         t["Versao"] = pd.to_numeric(t["Versao"], errors="coerce")
         t = t.sort_values(["_ano_arquivo", "Versao"])
-    chaves = ["CNPJ_Companhia", "exercicio", "classe", "_pagamento", "Dividendo_Distribuido"]
+    # DEDUPLICAÇÃO PELO MONTANTE, não pela data de pagamento.
+    #
+    # A mesma distribuição aparece em vários arquivos FRE, e nem todos trazem
+    # a data de pagamento. Caso real da LPSB3, exercício 2011: duas
+    # distribuições (dividendo de R$ 20.812.741 e JCP de R$ 15.369.215)
+    # aparecem em 6 linhas - arquivo 2012 sem data, arquivos 2013 e 2014 com
+    # data. Como NaN nunca é igual a NaN, as linhas sem data sobreviviam à
+    # deduplicação e o montante era contado em dobro.
+    #
+    # O montante é o identificador estável: duas distribuições diferentes da
+    # mesma empresa, no mesmo exercício e na mesma classe raramente têm valor
+    # idêntico até os centavos.
+    chaves = ["CNPJ_Companhia", "exercicio", "classe", "Dividendo_Distribuido", "Montante"]
+    antes_dedup = len(t)
+    # ordena com as linhas COM data por último, para que a versão preservada
+    # seja a que tem a informação mais completa
+    t["_tem_data"] = t["_pagamento"].notna()
+    t = t.sort_values(["_tem_data", "_ano_arquivo", "Versao"] if "Versao" in t.columns
+                       else ["_tem_data", "_ano_arquivo"])
     t = t.drop_duplicates(chaves, keep="last")
+    print(f"  {antes_dedup - len(t)} linhas duplicadas removidas "
+          f"(mesma distribuição repetida em vários arquivos FRE)")
     print(f"  {len(t)} distribuições distintas, {t['CNPJ_Companhia'].nunique()} empresas")
     return t
 
