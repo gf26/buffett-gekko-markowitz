@@ -144,7 +144,12 @@ def carregar_dividendos(anos):
     # O montante é o identificador estável: duas distribuições diferentes da
     # mesma empresa, no mesmo exercício e na mesma classe raramente têm valor
     # idêntico até os centavos.
-    chaves = ["CNPJ_Companhia", "exercicio", "classe", "Dividendo_Distribuido", "Montante"]
+    # arredonda o montante para o milhar antes de comparar: a mesma
+    # distribuição aparece com centavos diferentes entre arquivos (a Sabesp
+    # tem 823.492.690,00 e 823.492.680,00 para a mesma distribuição de JCP -
+    # 10 centavos de diferença faziam as duas sobreviverem à deduplicação).
+    t["_montante_chave"] = (t["Montante"] / 1000).round(0)
+    chaves = ["CNPJ_Companhia", "exercicio", "classe", "Dividendo_Distribuido", "_montante_chave"]
     antes_dedup = len(t)
     # ordena com as linhas COM data por último, para que a versão preservada
     # seja a que tem a informação mais completa
@@ -274,17 +279,23 @@ def mapa_cnpj_cd_cvm():
     return mapa
 
 
-def validar_contra_yahoo(engine, prov):
-    """Compara o valor calculado com a tabela `dividends` do Yahoo.
+def validar_contra_yahoo(engine, prov, tolerancia_dias=120):
+    """Compara CADA distribuição com o provento do Yahoo mais próximo em data.
 
-    É a checagem que decide se o método pode ser aplicado aos deslistados:
-    se bate nos tickers que o Yahoo cobre, bate nos que ele não cobre."""
+    POR QUE NÃO SOMAR POR EXERCÍCIO: a versão anterior somava todos os
+    proventos de um exercício social e comparava com a soma do ano-calendário
+    do Yahoo. Isso misturava três coisas num número só - duplicação residual,
+    desalinhamento temporal (o provento do exercício 2011 da LPSB3 foi pago em
+    junho/2012) e erro de contagem de ações. O resultado era ilegível: razão
+    mediana de 1,3 sem que se soubesse quanto vinha de cada causa.
+
+    Comparando distribuição a distribuição, cada divergência tem uma causa
+    identificável. Casos sem par no Yahoo dentro da tolerância são reportados
+    à parte, em vez de contaminarem a estatística."""
     with engine.connect() as conn:
         mapa = pd.read_sql(text("SELECT ticker, cd_cvm FROM ticker_cvm_map"), conn)
-        yah = pd.read_sql(text("""
-            SELECT ticker, EXTRACT(YEAR FROM ex_date)::int AS ano, SUM(amount) AS total_yahoo
-            FROM dividends GROUP BY 1, 2
-        """), conn)
+        yah = pd.read_sql(text(
+            "SELECT ticker, ex_date, amount FROM dividends WHERE amount > 0"), conn)
     if yah.empty:
         print("\n  Sem dados do Yahoo para comparar.")
         return
@@ -292,31 +303,66 @@ def validar_contra_yahoo(engine, prov):
     mapa["cd_cvm"] = mapa["cd_cvm"].astype(str).str.strip().str.lstrip("0")
     mapa["classe"] = mapa["ticker"].str.replace(".SA", "", regex=False).str[4:5].map(
         {"3": "ON", "4": "PN", "5": "PN", "6": "PN"})
+    yah["ex_date"] = pd.to_datetime(yah["ex_date"])
 
-    p = prov.groupby(["cd_cvm", "exercicio", "classe"], as_index=False)["valor_por_acao"].sum()
+    p = prov[prov["data_pagamento"].notna()].copy()
+    p["data_pagamento"] = pd.to_datetime(p["data_pagamento"])
     p = p.merge(mapa[["ticker", "cd_cvm", "classe"]], on=["cd_cvm", "classe"])
-    comp = p.merge(yah, left_on=["ticker", "exercicio"], right_on=["ticker", "ano"])
-    comp = comp[comp["total_yahoo"] > 0]
-    if comp.empty:
-        print("\n  Nenhum par comparável com o Yahoo.")
+    if p.empty:
+        print("\n  Nenhuma distribuição com data e ticker mapeado.")
         return
 
-    comp["razao"] = comp["valor_por_acao"] / comp["total_yahoo"]
-    dentro = comp["razao"].between(0.7, 1.3)
+    # para cada distribuição, o provento do Yahoo mais próximo no mesmo ticker
+    pares, sem_par = [], 0
+    for tk, g in p.groupby("ticker"):
+        y = yah[yah["ticker"] == tk]
+        if y.empty:
+            continue
+        for _, r in g.iterrows():
+            dif = (y["ex_date"] - r["data_pagamento"]).abs()
+            k = dif.idxmin()
+            if dif.loc[k] > pd.Timedelta(days=tolerancia_dias):
+                sem_par += 1
+                continue
+            pares.append({
+                "ticker": tk, "exercicio": r["exercicio"], "tipo": r["tipo"],
+                "pagamento": r["data_pagamento"].date(),
+                "ex_date_yahoo": y.loc[k, "ex_date"].date(),
+                "dias": int(dif.loc[k].days),
+                "calculado": r["valor_por_acao"],
+                "yahoo": float(y.loc[k, "amount"]),
+                "acoes": r["acoes_classe"],
+            })
+    if not pares:
+        print("\n  Nenhum par encontrado dentro da tolerância.")
+        return
+
+    c = pd.DataFrame(pares)
+    c["razao"] = c["calculado"] / c["yahoo"]
+
     print("\n" + "=" * 78)
-    print("VALIDAÇÃO CONTRA O YAHOO")
+    print("VALIDAÇÃO CONTRA O YAHOO - por distribuição individual")
     print("=" * 78)
-    print(f"{len(comp)} comparações (ticker × exercício), {comp['ticker'].nunique()} tickers")
-    print(f"  razão dentro de ±30%: {dentro.mean()*100:.1f}%")
-    print(f"  razão mediana: {comp['razao'].median():.3f}  (1,0 = coincidência perfeita)")
-    print("\n  Nota: divergência é esperada em parte - o exercício SOCIAL do FRE não")
-    print("  coincide com o ano-calendário da data-ex do Yahoo, então proventos de")
-    print("  dezembro caem em anos diferentes nas duas fontes.")
-    ruins = comp[~comp["razao"].between(0.5, 2.0)]
+    print(f"{len(c)} distribuições pareadas ({c['ticker'].nunique()} tickers), "
+          f"{sem_par} sem par em ±{tolerancia_dias} dias")
+    for faixa, lo, hi in [("±10%", 0.9, 1.1), ("±30%", 0.7, 1.3), ("±100%", 0.5, 2.0)]:
+        print(f"  dentro de {faixa:<7} {c['razao'].between(lo, hi).mean()*100:>5.1f}%")
+    print(f"  razão mediana: {c['razao'].median():.3f}")
+    print(f"  defasagem mediana entre pagamento e data-ex: {c['dias'].median():.0f} dias")
+
+    print("\n  Por tipo de provento:")
+    print(c.groupby("tipo").agg(
+        n=("razao", "size"),
+        razao_mediana=("razao", lambda s: round(s.median(), 3)),
+        dentro_30pct=("razao", lambda s: f"{s.between(0.7,1.3).mean()*100:.0f}%"),
+    ).sort_values("n", ascending=False).head(6).to_string())
+
+    ruins = c[~c["razao"].between(0.5, 2.0)]
     if not ruins.empty:
-        print(f"\n  {len(ruins)} casos com razão fora de 0,5-2,0 (10 maiores):")
+        print(f"\n  {len(ruins)} fora de 0,5-2,0. Os 10 maiores "
+              f"(a coluna 'acoes' revela se a causa é contagem):")
         print(ruins.nlargest(min(10, len(ruins)), "razao")[
-            ["ticker", "exercicio", "valor_por_acao", "total_yahoo", "razao"]].to_string(index=False))
+            ["ticker", "exercicio", "calculado", "yahoo", "razao", "acoes"]].to_string(index=False))
 
 
 def gravar(engine, prov):
