@@ -81,11 +81,30 @@ CREATE TABLE IF NOT EXISTS proventos_cvm (
     montante_total    NUMERIC,
     acoes_classe      NUMERIC,
     valor_por_acao    NUMERIC,
+    bruto_por_acao    NUMERIC,
     nome_companhia    TEXT,
     PRIMARY KEY (cd_cvm, exercicio, classe, data_pagamento, tipo)
 );
 CREATE INDEX IF NOT EXISTS idx_proventos_cvm_cd ON proventos_cvm(cd_cvm);
 """
+
+
+# JCP sofre retenção de 15% de IR na fonte. A empresa declara o montante
+# BRUTO no FRE; o acionista recebe o líquido, que é o que aparece nas fontes de
+# mercado e o que efetivamente afeta o preço na data-ex.
+#
+# Confirmado por medição: comparando distribuição a distribuição com o Yahoo,
+# a razão mediana ficou em 1,008 para "Dividendo Obrigatório" e 1,172 para
+# "Juros Sobre Capital Próprio". E 1/0,85 = 1,176 - praticamente o valor
+# observado. Não é estimativa, é a alíquota.
+IR_JCP = 0.15
+
+
+def _fator_liquido(tipo):
+    t = str(tipo or "").upper()
+    if "JUROS" in t and "CAPITAL" in t:
+        return 1.0 - IR_JCP
+    return 1.0
 
 
 def ler_zip_csv(ano, nome_base):
@@ -250,7 +269,8 @@ def calcular(div, aprovacoes, cnpj_para_cd):
             "tipo": str(r.get("Dividendo_Distribuido") or "")[:60] or None,
             "montante_total": float(r["Montante"]),
             "acoes_classe": float(n),
-            "valor_por_acao": float(r["Montante"]) / float(n),
+            "valor_por_acao": float(r["Montante"]) / float(n) * _fator_liquido(r.get("Dividendo_Distribuido")),
+            "bruto_por_acao": float(r["Montante"]) / float(n),
             "nome_companhia": str(r.get("Nome_Companhia") or "")[:120] or None,
         })
     if sem_acoes:
@@ -340,24 +360,43 @@ def validar_contra_yahoo(engine, prov, tolerancia_dias=120):
     c = pd.DataFrame(pares)
     c["razao"] = c["calculado"] / c["yahoo"]
 
+    # SEPARAR ERRO NOSSO DE ERRO DA FONTE.
+    #
+    # O Yahoo registra 0,0100 para proventos do Itaú em 2018 - um centavo por
+    # ação, quando o Itaú pagava mais de R$ 1,50. Com 4,96 bilhões de ações
+    # (contagem que sabemos estar correta), o valor calculado de R$ 1,59 é o
+    # plausível e o do Yahoo é que está truncado.
+    #
+    # Contar esses casos como "divergência" mediria a qualidade do Yahoo, não
+    # a do nosso método. Ficam separados: valor do Yahoo suspeito quando é
+    # baixo demais E a empresa é grande o bastante para que aquilo seja
+    # implausível.
+    c["yahoo_suspeito"] = (c["yahoo"] <= 0.02) & (c["acoes"] >= 100e6)
+    n_susp = int(c["yahoo_suspeito"].sum())
+    conf = c[~c["yahoo_suspeito"]]
+
     print("\n" + "=" * 78)
     print("VALIDAÇÃO CONTRA O YAHOO - por distribuição individual")
     print("=" * 78)
     print(f"{len(c)} distribuições pareadas ({c['ticker'].nunique()} tickers), "
           f"{sem_par} sem par em ±{tolerancia_dias} dias")
+    if n_susp:
+        print(f"  {n_susp} excluídas: valor do Yahoo <= R$ 0,02 em empresa com mais de")
+        print(f"     100 mi de ações - implausível, provável truncamento na fonte")
+    print(f"\n  Sobre as {len(conf)} confiáveis:")
     for faixa, lo, hi in [("±10%", 0.9, 1.1), ("±30%", 0.7, 1.3), ("±100%", 0.5, 2.0)]:
-        print(f"  dentro de {faixa:<7} {c['razao'].between(lo, hi).mean()*100:>5.1f}%")
-    print(f"  razão mediana: {c['razao'].median():.3f}")
-    print(f"  defasagem mediana entre pagamento e data-ex: {c['dias'].median():.0f} dias")
+        print(f"    dentro de {faixa:<7} {conf['razao'].between(lo, hi).mean()*100:>5.1f}%")
+    print(f"    razão mediana: {conf['razao'].median():.3f}")
+    print(f"    defasagem mediana entre pagamento e data-ex: {conf['dias'].median():.0f} dias")
 
     print("\n  Por tipo de provento:")
-    print(c.groupby("tipo").agg(
+    print(conf.groupby("tipo").agg(
         n=("razao", "size"),
         razao_mediana=("razao", lambda s: round(s.median(), 3)),
         dentro_30pct=("razao", lambda s: f"{s.between(0.7,1.3).mean()*100:.0f}%"),
     ).sort_values("n", ascending=False).head(6).to_string())
 
-    ruins = c[~c["razao"].between(0.5, 2.0)]
+    ruins = conf[~conf["razao"].between(0.5, 2.0)]
     if not ruins.empty:
         print(f"\n  {len(ruins)} fora de 0,5-2,0. Os 10 maiores "
               f"(a coluna 'acoes' revela se a causa é contagem):")
@@ -371,7 +410,8 @@ def gravar(engine, prov):
             if stmt.strip():
                 conn.execute(text(stmt))
     cols = ["cd_cvm", "exercicio", "classe", "data_pagamento", "tipo",
-            "montante_total", "acoes_classe", "valor_por_acao", "nome_companhia"]
+            "montante_total", "acoes_classe", "valor_por_acao", "bruto_por_acao",
+            "nome_companhia"]
     d = prov[cols].where(pd.notna(prov[cols]), None)
     linhas = list(d.itertuples(index=False, name=None))
     conn = engine.raw_connection()
