@@ -97,10 +97,20 @@ CREATE INDEX IF NOT EXISTS idx_proventos_cvm_cd ON proventos_cvm(cd_cvm);
 # a razão mediana ficou em 1,008 para "Dividendo Obrigatório" e 1,172 para
 # "Juros Sobre Capital Próprio". E 1/0,85 = 1,176 - praticamente o valor
 # observado. Não é estimativa, é a alíquota.
+# MEDIÇÃO, NÃO SUPOSIÇÃO: a hipótese de que o JCP entra líquido veio de uma
+# razão mediana de 1,172 contra o Yahoo. Mas essa medição incluía casos em que
+# o próprio Yahoo estava truncado (Itaú com R$ 0,01 por ação). Excluindo-os, a
+# razão do JCP cai para ~1,042 - e 15% corrige demais, levando a 0,886.
+#
+# Por isso é FLAG, não padrão: só se aplica com --jcp-liquido, e o efeito pode
+# ser medido em isolamento.
 IR_JCP = 0.15
+APLICAR_IR_JCP = False
 
 
 def _fator_liquido(tipo):
+    if not APLICAR_IR_JCP:
+        return 1.0
     t = str(tipo or "").upper()
     if "JUROS" in t and "CAPITAL" in t:
         return 1.0 - IR_JCP
@@ -371,7 +381,16 @@ def validar_contra_yahoo(engine, prov, tolerancia_dias=120):
     # a do nosso método. Ficam separados: valor do Yahoo suspeito quando é
     # baixo demais E a empresa é grande o bastante para que aquilo seja
     # implausível.
-    c["yahoo_suspeito"] = (c["yahoo"] <= 0.02) & (c["acoes"] >= 100e6)
+    # O critério anterior (valor <= R$ 0,02 e mais de 100 mi de ações) não
+    # pegava o BRB: 28 mi de ações e Yahoo reportando R$ 0,0002 - seis dos dez
+    # piores casos. Usar a RAZÃO entre as duas fontes é mais direto: quando
+    # divergem por mais de 20x, uma das duas está errada por ordem de
+    # grandeza, e o padrão observado (Itaú a R$ 0,01, BRB a R$ 0,0002) é de
+    # truncamento na fonte, não de erro nosso.
+    #
+    # ⚠️ Isto exclui casos da estatística, então pode mascarar erro nosso.
+    # Os excluídos são listados para conferência.
+    c["yahoo_suspeito"] = c["razao"] > 20
     n_susp = int(c["yahoo_suspeito"].sum())
     conf = c[~c["yahoo_suspeito"]]
 
@@ -381,8 +400,9 @@ def validar_contra_yahoo(engine, prov, tolerancia_dias=120):
     print(f"{len(c)} distribuições pareadas ({c['ticker'].nunique()} tickers), "
           f"{sem_par} sem par em ±{tolerancia_dias} dias")
     if n_susp:
-        print(f"  {n_susp} excluídas: valor do Yahoo <= R$ 0,02 em empresa com mais de")
-        print(f"     100 mi de ações - implausível, provável truncamento na fonte")
+        print(f"  {n_susp} excluídas por razão > 20x (provável truncamento no Yahoo).")
+        top = c[c["yahoo_suspeito"]].groupby("ticker").size().sort_values(ascending=False).head(6)
+        print(f"     concentradas em: {', '.join(f'{t}({n})' for t, n in top.items())}")
     print(f"\n  Sobre as {len(conf)} confiáveis:")
     for faixa, lo, hi in [("±10%", 0.9, 1.1), ("±30%", 0.7, 1.3), ("±100%", 0.5, 2.0)]:
         print(f"    dentro de {faixa:<7} {conf['razao'].between(lo, hi).mean()*100:>5.1f}%")
@@ -434,7 +454,15 @@ def main():
     p.add_argument("--de", type=int, default=2010)
     p.add_argument("--ate", type=int, default=2026)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--jcp-liquido", action="store_true",
+                    help="Desconta 15%% de IR do JCP. Medir o efeito antes de adotar: "
+                         "na amostra limpa a razão do JCP é ~1,04, e 15%% corrige demais.")
     args = p.parse_args()
+
+    global APLICAR_IR_JCP
+    APLICAR_IR_JCP = args.jcp_liquido
+    if APLICAR_IR_JCP:
+        print("(aplicando desconto de 15% de IR sobre JCP)\n")
 
     anos = list(range(args.de, args.ate + 1))
     print("Lendo distribuições de dividendos do FRE...")
