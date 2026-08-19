@@ -67,7 +67,15 @@ TIPO_CISAO = "CIS RED CAP"
 # faixa em que um salto é plausivelmente uma cisão. Fora dela, o evento é
 # sinalizado em vez de ajustado - um salto de 60% pode ser cisão grande ou
 # outra coisa acontecendo no mesmo pregão.
-CISAO_MIN, CISAO_MAX = 0.30, 0.95
+# Faixa em que um salto é plausivelmente uma cisão.
+#
+# Mínimo 0,20: o Pão de Açúcar cindiu o Assaí em 2021 e caiu 72% (salto de
+# 0,281). Com o mínimo em 0,30 esse caso era descartado.
+#
+# Máximo 0,95: saltos acima disso (CSAN3 0,957, SANB11 0,972, VIVR3 0,979)
+# são indistinguíveis de movimento normal de mercado. Forçar um fator ali
+# confundiria ruído com evento.
+CISAO_MIN, CISAO_MAX = 0.20, 0.95
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS prices_ajustados (
@@ -127,6 +135,32 @@ def fator_cisao(serie, data_ex):
     return r, f"medido no salto ({p_antes:.2f} -> {p_depois:.2f})"
 
 
+def escala_provento(ev_t, data_ex):
+    """Fator para trazer o provento à base de ações VIGENTE na data-ex.
+
+    O PROBLEMA: a brapi informa o provento na base de ações de HOJE, enquanto
+    o COTAHIST traz o preço da ÉPOCA. Quando houve grupamento no meio, as duas
+    bases divergem por ordens de grandeza.
+
+    Caso real: SANB3 negociava a R$ 0,14 em 2013 e a brapi informa dividendo
+    de R$ 1,56 - onze vezes o preço da ação, impossível. Houve grupamento
+    depois, então R$ 1,56 é por ação NOVA; por ação da época seria bem menos.
+
+    A CORREÇÃO: multiplicar o provento pelo produto dos fatores proporcionais
+    ocorridos DEPOIS da data-ex. Num grupamento de 1:55 (fator 0,018), o
+    provento de R$ 1,56 vira R$ 0,028 - coerente com preço de R$ 0,13.
+
+    Aplica-se só a eventos POSTERIORES à data-ex: os anteriores já estão
+    refletidos na base em que o provento foi declarado."""
+    posteriores = ev_t[(ev_t["ex_date"] > data_ex)
+                       & ev_t["tipo"].str.upper().isin(TIPOS_PROPORCIONAIS)
+                       & ev_t["fator"].notna()]
+    if posteriores.empty:
+        return 1.0
+    f = float(posteriores["fator"].astype(float).prod())
+    return f if f > 0 else 1.0
+
+
 def ajustar_ticker(px_t, ev_t):
     """Série ajustada de um ticker. Devolve (df, avisos)."""
     px_t = px_t.sort_values("date").set_index("date")
@@ -151,8 +185,13 @@ def ajustar_ticker(px_t, ev_t):
             if ant.empty:
                 continue
             p = float(ant.iloc[-1])   # fechamento da data-com
+            # traz o provento à base de ações da época (ver escala_provento).
+            # MULTIPLICA pelo fator: num grupamento de 1:55 (fator 0,0182),
+            # cada ação da época virou 0,0182 ação de hoje, então o provento
+            # por ação da época é 0,0182 vez o declarado por ação de hoje.
+            v = float(v) * escala_provento(ev_t, d)
             if p <= 0 or v >= p:
-                avisos.append(f"{d.date()} {tipo}: provento {v:.4f} >= preço {p:.2f} - ignorado")
+                avisos.append(f"{d.date()} {tipo}: provento {v:.6f} >= preço {p:.4f} - ignorado")
                 continue
             fator.loc[anteriores] *= (1 - v / p)
 
@@ -191,17 +230,29 @@ def gravar(engine, df):
                 None if pd.isna(r.fator_ajuste) else float(r.fator_ajuste),
                 None if pd.isna(r.volume) else float(r.volume))
               for r in d.itertuples(index=False)]
+    # GRAVAÇÃO EM LOTES.
+    #
+    # O execute_values monta UMA instrução SQL com todas as linhas. Com 1,32
+    # milhão delas, a string fica grande demais e o processo trava montando o
+    # comando - parecia loop infinito, e era só uma consulta gigante.
+    #
+    # Em lotes de 50 mil, cada instrução é administrável e o progresso fica
+    # visível.
+    LOTE = 50_000
     conn = engine.raw_connection()
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM prices_ajustados")
-            execute_values(cur, """
-                INSERT INTO prices_ajustados (ticker, date, close, adj_close, fator_ajuste, volume)
-                VALUES %s
-                ON CONFLICT (ticker, date) DO UPDATE SET
-                    adj_close = EXCLUDED.adj_close, fator_ajuste = EXCLUDED.fator_ajuste
-            """, linhas, page_size=5000)
-        conn.commit()
+            total = len(linhas)
+            for i in range(0, total, LOTE):
+                execute_values(cur, """
+                    INSERT INTO prices_ajustados (ticker, date, close, adj_close, fator_ajuste, volume)
+                    VALUES %s
+                    ON CONFLICT (ticker, date) DO UPDATE SET
+                        adj_close = EXCLUDED.adj_close, fator_ajuste = EXCLUDED.fator_ajuste
+                """, linhas[i:i + LOTE], page_size=5000)
+                conn.commit()
+                print(f"    gravadas {min(i + LOTE, total):,} de {total:,}")
     finally:
         conn.close()
     return len(linhas)
