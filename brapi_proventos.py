@@ -52,6 +52,7 @@ URL = "https://brapi.dev/api/quote/{ticker}"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS proventos_brapi (
+    id              BIGSERIAL PRIMARY KEY,
     ticker          TEXT NOT NULL,
     ex_date         DATE NOT NULL,
     tipo            TEXT NOT NULL,
@@ -59,9 +60,19 @@ CREATE TABLE IF NOT EXISTS proventos_brapi (
     fator           NUMERIC,
     data_pagamento  DATE,
     data_aprovacao  DATE,
-    isin            TEXT,
-    PRIMARY KEY (ticker, ex_date, tipo, valor)
+    isin            TEXT
 );
+-- Chave natural via índice único, não via PRIMARY KEY: eventos
+-- proporcionais (GRUPAMENTO, DESDOBRAMENTO, BONIFICACAO) têm `valor` NULO
+-- por definição - eles alteram a quantidade de ações, não distribuem
+-- dinheiro. Coluna de PRIMARY KEY não aceita nulo no Postgres, o que fazia a
+-- carga falhar em NotNullViolation.
+--
+-- COALESCE resolve: nulo vira -1, que nunca colide com valor real (sempre
+-- positivo) nem com fator.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_proventos_brapi
+    ON proventos_brapi (ticker, ex_date, tipo,
+                        COALESCE(valor, -1), COALESCE(fator, -1));
 CREATE INDEX IF NOT EXISTS idx_proventos_brapi_ticker ON proventos_brapi(ticker);
 CREATE INDEX IF NOT EXISTS idx_proventos_brapi_ex ON proventos_brapi(ex_date);
 """
@@ -167,7 +178,9 @@ def gravar(engine, linhas):
     # o mesmo valor seriam indistinguíveis - descartar a repetida é correto
     vistos, unicas = set(), []
     for l in linhas:
-        k = (l[0], l[1], l[2], l[3])
+        # inclui o fator na chave: dois eventos proporcionais na mesma data
+        # com fatores diferentes são eventos distintos
+        k = (l[0], l[1], l[2], l[3], l[4])
         if k not in vistos:
             vistos.add(k)
             unicas.append(l)
@@ -179,7 +192,8 @@ def gravar(engine, linhas):
                 INSERT INTO proventos_brapi
                     (ticker, ex_date, tipo, valor, fator, data_pagamento, data_aprovacao, isin)
                 VALUES %s
-                ON CONFLICT (ticker, ex_date, tipo, valor) DO NOTHING
+                ON CONFLICT (ticker, ex_date, tipo, COALESCE(valor, -1), COALESCE(fator, -1))
+                DO NOTHING
             """, unicas, page_size=2000)
         conn.commit()
     finally:
