@@ -105,10 +105,17 @@ def carregar(engine, tickers=None):
 def fator_cisao(serie, data_ex):
     """Mede o fator da cisão pelo salto de preço.
 
-    Devolve (fator, motivo). Fator None significa que o salto não é
-    plausível como cisão e o evento deve ser sinalizado, não ajustado."""
-    antes = serie[serie.index < data_ex]
-    depois = serie[serie.index >= data_ex]
+    `data_ex` aqui é a data-COM (lastDatePrior da brapi): a última data em que
+    o papel ainda dá direito ao evento. O salto acontece no pregão SEGUINTE.
+
+    No Itaú: data-com 2021-10-01 com fechamento de R$ 29,67; o preço cai para
+    R$ 24,34 em 04/10. Comparar em torno de 01/10 (em vez de depois dela) dava
+    razão de 1,026 e o evento era descartado como implausível.
+
+    Devolve (fator, motivo). Fator None significa que o salto não é plausível
+    como cisão e o evento deve ser sinalizado, não ajustado."""
+    antes = serie[serie.index <= data_ex]
+    depois = serie[serie.index > data_ex]
     if antes.empty or depois.empty:
         return None, "sem preço antes ou depois"
     p_antes, p_depois = float(antes.iloc[-1]), float(depois.iloc[0])
@@ -129,7 +136,10 @@ def ajustar_ticker(px_t, ev_t):
 
     for _, e in ev_t.sort_values("ex_date").iterrows():
         d, tipo = e["ex_date"], str(e["tipo"]).upper()
-        anteriores = fator.index < d
+        # `ex_date` é a data-COM: quem tem o papel nela ainda recebe o
+        # provento. O preço só reflete o evento no pregão SEGUINTE, então o
+        # ajuste vale para as datas ATÉ ela, inclusive.
+        anteriores = fator.index <= d
         if not anteriores.any():
             continue
 
@@ -137,10 +147,10 @@ def ajustar_ticker(px_t, ev_t):
             v = e["valor"]
             if pd.isna(v) or v <= 0:
                 continue
-            ant = close[close.index < d]
+            ant = close[close.index <= d]
             if ant.empty:
                 continue
-            p = float(ant.iloc[-1])
+            p = float(ant.iloc[-1])   # fechamento da data-com
             if p <= 0 or v >= p:
                 avisos.append(f"{d.date()} {tipo}: provento {v:.4f} >= preço {p:.2f} - ignorado")
                 continue
