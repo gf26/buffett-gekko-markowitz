@@ -66,7 +66,10 @@ LIQUIDOS = ["PETR4", "VALE3", "ITUB4", "BBDC4", "WEGE3"]
 
 
 def buscar(ticker, token, **params):
-    p = {"token": token, **params}
+    # `dividends=true` é OBRIGATÓRIO para a resposta incluir dividendsData.
+    # Sem ele, PETR4 e VALE3 voltavam com zero dividendos - o que parecia
+    # limitação da brapi e era parâmetro faltando.
+    p = {"token": token, "dividends": "true", **params}
     try:
         r = requests.get(URL.format(ticker=ticker), params=p, timeout=40)
     except requests.exceptions.RequestException as e:
@@ -113,11 +116,15 @@ def teste_deslistadas(token):
         print(f"           {desc}")
         time.sleep(0.4)
     print(f"\n  VEREDITO: {ok} de {len(DESLISTADAS)} com histórico.")
-    if ok >= len(DESLISTADAS) * 0.6:
-        print("  A brapi cobre deslistadas - é razão suficiente para assinar.")
+    if ok == len(DESLISTADAS):
+        print("  Cobertura completa - resolve o viés de sobrevivência sozinha.")
+    elif ok >= 3:
+        print("  COBERTURA PARCIAL. A brapi MANTÉM deslistados (VALE5, com série")
+        print("  de 2000 a 2019, prova isso), mas não todos. Não substitui o")
+        print("  COTAHIST, que tem os 1.080 tickers - complementa como árbitro")
+        print("  e como fonte de proventos com data-ex.")
     else:
-        print("  A brapi NÃO cobre deslistadas. O valor dela cai bastante:")
-        print("  restaria como árbitro e como substituta do Yahoo no incremental.")
+        print("  Cobertura muito baixa - o COTAHIST continua sendo o caminho.")
     return ok
 
 
@@ -137,7 +144,7 @@ def teste_profundidade(token):
         bal = bal.get("balanceSheetStatements", bal) if isinstance(bal, dict) else bal
         import datetime as dt
         p0 = dt.datetime.fromtimestamp(h[0]["date"]).date() if h else "-"
-        dv = sorted(str(c.get("paymentDate") or c.get("date") or "")[:10] for c in cash)
+        dv = sorted(str(c.get("lastDatePrior") or c.get("paymentDate") or "")[:10] for c in cash)
         bl = sorted(str(b.get("endDate") or "")[:10] for b in (bal or []))
         print(f"  {tk:<8} preços desde {p0}")
         print(f"           dividendos: {len(cash)} registros, mais antigo {dv[0] if dv else '-'}")
@@ -159,8 +166,11 @@ def teste_divergentes(token):
             time.sleep(0.4)
             continue
         cash = ((d or {}).get("dividendsData", {}) or {}).get("cashDividends") or []
+        # lastDatePrior é a DATA-EX (última data com direito ao provento) -
+        # é ela que afeta o preço e que deve ser usada para ajuste. O
+        # paymentDate vem semanas depois.
         do_ano = [c for c in cash
-                  if str(c.get("paymentDate") or c.get("date") or "").startswith(str(ano))]
+                  if str(c.get("lastDatePrior") or c.get("paymentDate") or "").startswith(str(ano))]
         total = sum(float(c.get("rate") or 0) for c in do_ano)
         if not do_ano:
             v = "sem dados"
@@ -185,9 +195,11 @@ def teste_splits(token):
             print(f"  {tk:<8} {err[:55]}")
             time.sleep(0.4)
             continue
-        sp = ((d or {}).get("dividendsData", {}) or {}).get("stockDividends") or []
+        dd = (d or {}).get("dividendsData", {}) or {}
+        sp = dd.get("stockDividends") or []
         if sp:
-            datas = sorted(str(s.get("approvedOn") or s.get("date") or "")[:10] for s in sp)
+            datas = sorted(str(s.get("lastDatePrior") or s.get("approvedOn")
+                                or s.get("date") or "")[:10] for s in sp)
             print(f"  {tk:<8} {len(sp):>3} eventos, de {datas[0]} a {datas[-1]}")
         else:
             print(f"  {tk:<8} nenhum evento retornado")
