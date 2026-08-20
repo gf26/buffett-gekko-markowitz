@@ -142,6 +142,55 @@ def fator_cisao(serie, data_ex):
     return r, f"medido no salto ({p_antes:.2f} -> {p_depois:.2f})"
 
 
+JANELA_EVENTO = 5   # pregões de tolerância em torno da data informada
+
+
+def localizar_evento(close, data_ex, fator_esperado, janela=JANELA_EVENTO):
+    """Encontra o pregão em que o evento proporcional de fato ocorreu.
+
+    POR QUE NÃO CONFIAR NA DATA DA FONTE: ela é inconsistente. No MGLU3, o
+    desdobramento 1:8 é informado em 06/08/2019 e o preço cai exatamente nesse
+    dia (276,00 -> 36,60). No ITUB4, o grupamento 1:100 é informado em
+    01/11/2011 mas o preço não muda ali (32,73 -> 32,13) - o COTAHIST já
+    estava grupado antes. Nenhuma convenção fixa serve para os dois.
+
+    A SOLUÇÃO: o fator é CONHECIDO (8,0 no Magalu, 0,01 no Itaú); só a data é
+    incerta. Procurar numa janela o pregão em que a razão entre fechamentos
+    consecutivos se aproxima do fator esperado localiza o evento sem
+    adivinhar seu tamanho. Um salto de exatamente 8x é inconfundível.
+
+    Devolve (data_do_evento, razao_observada) ou (None, motivo) quando nenhum
+    pregão da janela mostra o salto - caso em que o evento não deve ser
+    aplicado. Foi assim que descobrimos que o desdobramento da WEGE3 em 2015
+    existe no preço mas NÃO está na fonte."""
+    idx = close.index
+    pos = idx.searchsorted(data_ex)
+    ini, fim = max(1, pos - janela), min(len(idx), pos + janela + 1)
+    if ini >= fim:
+        return None, "fora do histórico de preços"
+
+    # razão esperada entre o fechamento do dia e o do pregão anterior:
+    # num desdobramento 1:8 o preço cai para 1/8
+    alvo = 1.0 / fator_esperado
+    melhor, melhor_erro = None, None
+    for i in range(ini, fim):
+        anterior, atual = float(close.iloc[i - 1]), float(close.iloc[i])
+        if anterior <= 0:
+            continue
+        r = atual / anterior
+        erro = abs(r / alvo - 1)
+        if melhor_erro is None or erro < melhor_erro:
+            melhor, melhor_erro = idx[i], erro
+
+    # 25% de tolerância: o salto carrega o movimento normal do dia junto.
+    # O MGLU3 caiu 86,7% num desdobramento de 87,5% - resíduo de 6%, que é o
+    # retorno real da ação naquele pregão.
+    if melhor_erro is None or melhor_erro > 0.25:
+        return None, (f"nenhum salto próximo de {alvo:.4f} em ±{janela} pregões"
+                       + (f" (melhor: erro de {melhor_erro:.0%})" if melhor_erro else ""))
+    return melhor, melhor_erro
+
+
 def fator_proporcional(tipo, f):
     """Fator de um evento proporcional, com o sentido conferido.
 
@@ -184,7 +233,7 @@ def escala_provento(ev_t, data_ex):
 
     Aplica-se só a eventos POSTERIORES à data-ex: os anteriores já estão
     refletidos na base em que o provento foi declarado."""
-    posteriores = ev_t[(ev_t["ex_date"] > data_ex)
+    posteriores = ev_t[(ev_t["ex_date"] >= data_ex)
                        & ev_t["tipo"].str.upper().isin(TIPOS_PROPORCIONAIS)
                        & ev_t["fator"].notna()]
     if posteriores.empty:
@@ -206,11 +255,23 @@ def ajustar_ticker(px_t, ev_t):
 
     for _, e in ev_t.sort_values("ex_date").iterrows():
         d, tipo = e["ex_date"], str(e["tipo"]).upper()
-        # `ex_date` é a data-COM: quem tem o papel nela ainda recebe o
-        # provento. O preço só reflete o evento no pregão SEGUINTE, então o
-        # ajuste vale para as datas ATÉ ela, inclusive.
+
+        # ALINHAMENTO DEPENDE DO TIPO DE EVENTO - verificado nos dados:
+        #
+        # PROPORCIONAIS: o COTAHIST já reflete o evento NA data que a fonte
+        #   informa. MGLU3 cai de 276,00 (05/08/2019) para 36,60 (06/08) e a
+        #   fonte informa 06/08; ITUB4 já estava grupado antes de 01/11/2011.
+        #   Ajustar "até a data inclusive" criava um salto artificial de 694%
+        #   no Magalu. O ajuste vale para datas ESTRITAMENTE ANTERIORES.
+        #
+        # DINHEIRO E CISÃO: o efeito aparece no pregão SEGUINTE. Na cisão do
+        #   Itaú, o preço vai de 29,67 (01/10/2021, a data informada) para
+        #   24,34 (04/10). Ajustar até a data inclusive é o correto.
+        # proporcionais têm a data localizada pelo salto (ver
+        # localizar_evento); dinheiro e cisão usam a data informada, cujo
+        # efeito aparece no pregão seguinte
         anteriores = fator.index <= d
-        if not anteriores.any():
+        if tipo not in TIPOS_PROPORCIONAIS and not anteriores.any():
             continue
 
         if tipo in TIPOS_DINHEIRO:
@@ -256,7 +317,12 @@ def ajustar_ticker(px_t, ev_t):
             f = fator_proporcional(tipo, e["fator"])
             if not f:
                 continue
-            fator.loc[anteriores] /= f
+            # localiza o pregão do evento pelo salto, não pela data da fonte
+            data_real, info = localizar_evento(close, d, f)
+            if data_real is None:
+                avisos.append(f"{d.date()} {tipo} (fator {f:.4f}): {info} - NÃO aplicado")
+                continue
+            fator.loc[fator.index < data_real] /= f
 
         elif tipo == TIPO_CISAO:
             f, motivo = fator_cisao(close, d)
