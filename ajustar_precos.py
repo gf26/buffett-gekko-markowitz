@@ -293,10 +293,19 @@ def ajustar_ticker(px_t, ev_t):
                     f *= v
             tipo_repr = g["_tipo"].iloc[0] if len(g) == 1 else "PROPORCIONAL COMBINADO"
             combinados.append({"ex_date": d, "tipo": tipo_repr, "valor": None, "fator": f})
-        # evita FutureWarning: concat com DataFrame vazio muda o dtype do
-        # resultado em versões futuras do pandas
-        novos = pd.DataFrame(combinados)
-        ev_t = novos if outros.empty else pd.concat([outros, novos], ignore_index=True)
+        # Monta o resultado sem concat.
+        #
+        # O FutureWarning do pandas dispara quando um dos DataFrames tem
+        # coluna toda nula - e `valor` é sempre None em evento proporcional,
+        # por definição. Verificar se o DataFrame está vazio não resolve:
+        # o problema é a coluna nula, não a ausência de linhas.
+        #
+        # Construir a lista de dicionários e criar o DataFrame de uma vez
+        # evita a questão inteira.
+        registros = outros.to_dict("records") + combinados
+        ev_t = pd.DataFrame(registros)
+        if ev_t.empty:
+            ev_t = outros
 
     for _, e in ev_t.sort_values("ex_date").iterrows():
         d, tipo = e["ex_date"], str(e["tipo"]).upper()
