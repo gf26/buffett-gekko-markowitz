@@ -62,6 +62,9 @@ from sqlalchemy import create_engine, text
 
 TIPOS_DINHEIRO = {"DIVIDENDO", "JCP", "RENDIMENTO", "REST CAP DIN"}
 TIPOS_PROPORCIONAIS = {"DESDOBRAMENTO", "GRUPAMENTO", "BONIFICACAO"}
+# rótulo usado quando dois ou mais eventos proporcionais caem na mesma data
+TIPO_COMBINADO = "PROPORCIONAL COMBINADO"
+TIPOS_PROPORCIONAIS_TODOS = TIPOS_PROPORCIONAIS | {TIPO_COMBINADO}
 TIPO_CISAO = "CIS RED CAP"
 
 # faixa em que um salto é plausivelmente uma cisão. Fora dela, o evento é
@@ -185,7 +188,11 @@ def localizar_evento(close, data_ex, fator_esperado, janela=JANELA_EVENTO):
     # 25% de tolerância: o salto carrega o movimento normal do dia junto.
     # O MGLU3 caiu 86,7% num desdobramento de 87,5% - resíduo de 6%, que é o
     # retorno real da ação naquele pregão.
-    if melhor_erro is None or melhor_erro > 0.25:
+    # 40% de tolerância: o salto carrega o movimento normal do dia. Casos
+    # reais ficavam logo acima de 25% - BALM3 com 33%, BPAC11 e CEED3 com 29%,
+    # CTKA3 com 43%. Como o alvo é uma razão específica (10x, 100x), 40% ainda
+    # é seletivo: um movimento normal de mercado nunca chega perto de 10x.
+    if melhor_erro is None or melhor_erro > 0.40:
         return None, (f"nenhum salto próximo de {alvo:.4f} em ±{janela} pregões"
                        + (f" (melhor: erro de {melhor_erro:.0%})" if melhor_erro else ""))
     return melhor, melhor_erro
@@ -253,6 +260,30 @@ def ajustar_ticker(px_t, ev_t):
     fator = pd.Series(1.0, index=close.index)
     avisos = []
 
+    # COMBINA EVENTOS PROPORCIONAIS DA MESMA DATA.
+    #
+    # É prática comum no Brasil grupar e desdobrar em sequência para acertar a
+    # quantidade de ações. BMEB3 em 2021-12-02 tem GRUPAMENTO 0,5 E
+    # DESDOBRAMENTO 20 no mesmo dia; CASH3 em 2023-05-31 tem 0,01 e 10.
+    #
+    # Processados um a um, nenhum bate com o salto observado - mas o produto
+    # bate: 0,5 x 20 = 10 no BMEB3. Consolidar antes de localizar resolve.
+    ev_t = ev_t.copy()
+    ev_t["_tipo"] = ev_t["tipo"].astype(str).str.upper()
+    prop = ev_t[ev_t["_tipo"].isin(TIPOS_PROPORCIONAIS) & ev_t["fator"].notna()]
+    outros = ev_t[~ev_t.index.isin(prop.index)]
+    if len(prop) > 0:
+        combinados = []
+        for d, g in prop.groupby("ex_date"):
+            f = 1.0
+            for _, r in g.iterrows():
+                v = fator_proporcional(r["_tipo"], r["fator"])
+                if v:
+                    f *= v
+            tipo_repr = g["_tipo"].iloc[0] if len(g) == 1 else "PROPORCIONAL COMBINADO"
+            combinados.append({"ex_date": d, "tipo": tipo_repr, "valor": None, "fator": f})
+        ev_t = pd.concat([outros, pd.DataFrame(combinados)], ignore_index=True)
+
     for _, e in ev_t.sort_values("ex_date").iterrows():
         d, tipo = e["ex_date"], str(e["tipo"]).upper()
 
@@ -271,7 +302,7 @@ def ajustar_ticker(px_t, ev_t):
         # localizar_evento); dinheiro e cisão usam a data informada, cujo
         # efeito aparece no pregão seguinte
         anteriores = fator.index <= d
-        if tipo not in TIPOS_PROPORCIONAIS and not anteriores.any():
+        if tipo not in TIPOS_PROPORCIONAIS_TODOS and not anteriores.any():
             continue
 
         if tipo in TIPOS_DINHEIRO:
@@ -313,8 +344,8 @@ def ajustar_ticker(px_t, ev_t):
                 continue
             fator.loc[anteriores] *= (1 - v_usado / p)
 
-        elif tipo in TIPOS_PROPORCIONAIS:
-            f = fator_proporcional(tipo, e["fator"])
+        elif tipo in TIPOS_PROPORCIONAIS_TODOS:
+            f = float(e["fator"]) if pd.notna(e["fator"]) else None
             if not f:
                 continue
             # localiza o pregão do evento pelo salto, não pela data da fonte
