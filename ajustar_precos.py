@@ -91,8 +91,15 @@ CREATE INDEX IF NOT EXISTS idx_prices_ajustados_date ON prices_ajustados(date);
 """
 
 
+# BDR = ação estrangeira negociada aqui, fora do escopo de um screener da B3.
+# O código termina em dois dígitos começando com 3 (AAPL34, BIJH39). Ações e
+# units brasileiras usam 3, 4, 5, 6 ou 11 - nunca 3x.
+RE_BDR = r"^[A-Z]{4}3[0-9]$"
+
+
 def carregar(engine, tickers=None):
-    cond, params = ["close IS NOT NULL", "close > 0"], {}
+    cond, params = ["close IS NOT NULL", "close > 0",
+                    f"ticker !~ '{RE_BDR}'"], {}
     if tickers:
         cond.append("ticker = ANY(:tk)")
         params["tk"] = tickers
@@ -135,6 +142,31 @@ def fator_cisao(serie, data_ex):
     return r, f"medido no salto ({p_antes:.2f} -> {p_depois:.2f})"
 
 
+def fator_proporcional(tipo, f):
+    """Fator de um evento proporcional, com o sentido conferido.
+
+    A convenção da fonte é `fator` = razão nova/antiga: desdobramento vem > 1
+    (MGLU3 1:8 -> 8.0), grupamento vem < 1 (AERI3 1:20 -> 0.05). Verificado
+    contra casos conhecidos.
+
+    Mas 8 registros de 396 vêm invertidos - o BMEB3 tem GRUPAMENTO com fator
+    2.0, que aplicado como está dividiria o preço em vez de multiplicar. Como
+    o TIPO do evento define o sentido esperado, a inconsistência é detectável
+    e corrigível: 2.0 num grupamento significa "2 viram 1", ou seja, 0.5.
+
+    São 2% dos casos. Medir o fator no salto de preço para TODOS os eventos
+    resolveria também, mas trocaria uma regra correta em 98% por uma medição
+    sujeita a ruído de mercado."""
+    if f is None or pd.isna(f) or f <= 0:
+        return None
+    f = float(f)
+    if tipo == "GRUPAMENTO" and f > 1:
+        return 1.0 / f
+    if tipo == "DESDOBRAMENTO" and f < 1:
+        return 1.0 / f
+    return f
+
+
 def escala_provento(ev_t, data_ex):
     """Fator para trazer o provento à base de ações VIGENTE na data-ex.
 
@@ -157,7 +189,11 @@ def escala_provento(ev_t, data_ex):
                        & ev_t["fator"].notna()]
     if posteriores.empty:
         return 1.0
-    f = float(posteriores["fator"].astype(float).prod())
+    f = 1.0
+    for _, r in posteriores.iterrows():
+        v = fator_proporcional(str(r["tipo"]).upper(), r["fator"])
+        if v:
+            f *= v
     return f if f > 0 else 1.0
 
 
@@ -185,19 +221,40 @@ def ajustar_ticker(px_t, ev_t):
             if ant.empty:
                 continue
             p = float(ant.iloc[-1])   # fechamento da data-com
-            # traz o provento à base de ações da época (ver escala_provento).
-            # MULTIPLICA pelo fator: num grupamento de 1:55 (fator 0,0182),
-            # cada ação da época virou 0,0182 ação de hoje, então o provento
-            # por ação da época é 0,0182 vez o declarado por ação de hoje.
-            v = float(v) * escala_provento(ev_t, d)
-            if p <= 0 or v >= p:
-                avisos.append(f"{d.date()} {tipo}: provento {v:.6f} >= preço {p:.4f} - ignorado")
+            if p <= 0:
                 continue
-            fator.loc[anteriores] *= (1 - v / p)
+
+            # TENTATIVA DUPLA: a fonte não diz em qual base de ações o provento
+            # está, e usa bases diferentes em registros diferentes.
+            #
+            #   SANB3 2013: fonte diz R$ 1,56, preço era R$ 0,13 - impossível.
+            #     Houve grupamento 1:55 depois; reescalado dá R$ 0,028. OK.
+            #   BMEB3 2010: fonte diz R$ 0,86, preço era R$ 15,60 - plausível
+            #     direto. Reescalar pelo desdobramento 20:1 posterior daria
+            #     R$ 34,39, impossível.
+            #
+            # Não há campo que distinga os dois. O PREÇO serve de árbitro: um
+            # provento é sempre menor que o valor da ação (senão a empresa
+            # distribuiria mais do que vale). Fica a base que é consistente.
+            #
+            # FRAGILIDADE CONHECIDA: quando ambas as bases couberem, escolhe o
+            # bruto sem certeza. Acontece em papel de preço alto com evento
+            # proporcional pequeno posterior.
+            bruto = float(v)
+            reescalado = bruto * escala_provento(ev_t, d)
+            if bruto < p:
+                v_usado = bruto
+            elif reescalado < p:
+                v_usado = reescalado
+            else:
+                avisos.append(f"{d.date()} {tipo}: nem bruto ({bruto:.4f}) nem "
+                               f"reescalado ({reescalado:.4f}) cabem no preço {p:.4f} - ignorado")
+                continue
+            fator.loc[anteriores] *= (1 - v_usado / p)
 
         elif tipo in TIPOS_PROPORCIONAIS:
-            f = e["fator"]
-            if pd.isna(f) or f <= 0:
+            f = fator_proporcional(tipo, e["fator"])
+            if not f:
                 continue
             fator.loc[anteriores] /= f
 
