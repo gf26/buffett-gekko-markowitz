@@ -167,10 +167,21 @@ def localizar_evento(close, data_ex, fator_esperado, janela=JANELA_EVENTO):
     aplicado. Foi assim que descobrimos que o desdobramento da WEGE3 em 2015
     existe no preço mas NÃO está na fonte."""
     idx = close.index
+    if len(idx) < 2:
+        return None, None      # None em ambos = ignorar sem avisar
+
+    # EVENTO FORA DO INTERVALO DE PREÇOS: metade dos eventos proporcionais
+    # (301 de 630) tem data fora da série do próprio ticker - a AMER3 tem
+    # preços de 2021 a 2023 e um grupamento de 2024. Não há salto para
+    # localizar, por definição, e o evento não afeta a série. Ignorar em
+    # silêncio evita 300 avisos que não indicam problema algum.
+    if data_ex < idx[0] or data_ex > idx[-1]:
+        return None, None
+
     pos = idx.searchsorted(data_ex)
     ini, fim = max(1, pos - janela), min(len(idx), pos + janela + 1)
     if ini >= fim:
-        return None, "fora do histórico de preços"
+        return None, "janela vazia"
 
     # razão esperada entre o fechamento do dia e o do pregão anterior:
     # num desdobramento 1:8 o preço cai para 1/8
@@ -282,7 +293,10 @@ def ajustar_ticker(px_t, ev_t):
                     f *= v
             tipo_repr = g["_tipo"].iloc[0] if len(g) == 1 else "PROPORCIONAL COMBINADO"
             combinados.append({"ex_date": d, "tipo": tipo_repr, "valor": None, "fator": f})
-        ev_t = pd.concat([outros, pd.DataFrame(combinados)], ignore_index=True)
+        # evita FutureWarning: concat com DataFrame vazio muda o dtype do
+        # resultado em versões futuras do pandas
+        novos = pd.DataFrame(combinados)
+        ev_t = novos if outros.empty else pd.concat([outros, novos], ignore_index=True)
 
     for _, e in ev_t.sort_values("ex_date").iterrows():
         d, tipo = e["ex_date"], str(e["tipo"]).upper()
@@ -351,7 +365,8 @@ def ajustar_ticker(px_t, ev_t):
             # localiza o pregão do evento pelo salto, não pela data da fonte
             data_real, info = localizar_evento(close, d, f)
             if data_real is None:
-                avisos.append(f"{d.date()} {tipo} (fator {f:.4f}): {info} - NÃO aplicado")
+                if info is not None:   # None = fora do alcance, não é problema
+                    avisos.append(f"{d.date()} {tipo} (fator {f:.4f}): {info} - NÃO aplicado")
                 continue
             fator.loc[fator.index < data_real] /= f
 
