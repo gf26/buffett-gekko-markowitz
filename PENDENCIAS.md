@@ -183,7 +183,21 @@ companhia aberta em setembro/2025, então não há DFP anterior.
 
 ---
 
-## 6. Viés de sobrevivência (limitação estrutural)
+## 6. Viés de sobrevivência — 🔧 EM RESOLUÇÃO
+
+**Progresso:** o COTAHIST foi carregado (1,32 mi de preços, 1.080 tickers,
+2010-2026) e ajustado por proventos e eventos societários (1.311.044 preços
+ajustados, 925 tickers após filtrar BDRs). Contra 351 tickers do Yahoo.
+
+Tickers que existiam e o Yahoo não tem: CCRO3 (CCR/Motiva), CIEL3 (Cielo),
+ENBR3 (EDP), SGPS3, TRPL4, VALE5, ELET6, CPLE6, RAPT4, SANB4, GOLL4 e
+centenas de outros.
+
+**Falta:** validar a série ajustada contra a brapi em tickers líquidos. Se
+bater, o método está provado e vale para os ~600 deslistados que só o COTAHIST
+tem — e aí o viés fica de fato resolvido.
+
+### Registro do que era o problema
 
 Empresas deslistadas antes do início da coleta não estão na base. O Yahoo
 remove tickers que saem da bolsa em vez de arquivá-los, e a brapi tem a mesma
@@ -446,3 +460,57 @@ FRE com a `ticker_cvm_map`.
 **Prioridade:** média. Não bloqueia nada, mas convém saber quais tickers do
 universo ativo dependem de tipo não-integralizado antes de confiar no
 valuation deles.
+
+---
+
+## 13. Avisos residuais no ajuste de preços (18 casos)
+
+Depois de três rodadas de correção (fator invertido, tentativa dupla de base
+do provento, faixa de cisão ampliada), sobraram 18 avisos em 1,31 milhão de
+preços. Cada um deixa um degrau na série daquele ticker naquela data — não
+impede o uso, mas um fator de momentum veria movimento que não existiu.
+
+### HBTS5 — 13 dos 18, causa desconhecida
+
+A Habitasul aparece com dividendos de 5 a 20 vezes o preço da ação, de forma
+consistente por 13 anos (2011 a 2026). Bruto e reescalado dão o mesmo valor,
+porque não há evento proporcional posterior — a reescala não tem o que
+corrigir.
+
+Não é erro pontual da fonte: é padrão sistemático. Hipóteses não verificadas:
+a brapi pode estar reportando o provento de outra classe de ação, ou o
+montante total em vez do valor por ação.
+
+**Impacto prático: nulo.** HBTS5 é papel de liquidez muito baixa, descartado
+pelo filtro de R$ 50 mil/dia.
+
+### Cisões com salto pequeno — 4 casos
+
+CSAN3 (0,957), SANB3 (0,975), SANB11 (0,972), VIVR3 (0,979). Saltos de 2-4%
+são indistinguíveis de movimento normal de mercado. **Não ajustar é o
+comportamento correto** — forçar um fator confundiria ruído com evento.
+
+### CEGR3 e FIGE4 — 1 caso cada
+
+Provento acima do preço sem evento proporcional que explique. Mesma categoria
+do HBTS5, em menor escala.
+
+---
+
+## 14. Tickers com liquidez residual na base
+
+O ajuste revelou papéis com histórico tecnicamente presente mas praticamente
+inútil:
+
+- **CALI3**: 214 pregões em 16 anos, fator de ajuste acumulado de 0,0015
+- **CEBR6**: fator 0,0051
+- **NUTR3**: fator 0,0100
+
+Não são erros — são papéis que quase não negociam. O filtro de liquidez já os
+descarta do universo investível, mas eles entram em estatísticas agregadas
+(como o 1/N do universo) se não forem filtrados explicitamente.
+
+**Ação sugerida:** ao construir o painel de dados point-in-time (item 2 do
+`relatorio_analise_quant.md`), aplicar um piso de pregões por ano além do piso
+de volume financeiro. Um papel com 13 pregões por ano não tem preço confiável
+em nenhuma data de rebalanceamento.
