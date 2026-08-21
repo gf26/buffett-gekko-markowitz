@@ -36,15 +36,18 @@ import re
 import sys
 import time
 
+import numpy as np
 import pandas as pd
 import requests
 
 import cvm_fonte
 
 # descrições que identificam CapEx com razoável confiança
+# grupos SEM captura (?:...) - com captura, o str.contains do pandas emite
+# UserWarning sugerindo str.extract
 RE_CAPEX = re.compile(
-    r"(aquisi|adi[cç]|aplica|compra|investiment).{0,40}(imobiliz|intang)"
-    r"|(imobiliz|intang).{0,30}(aquisi|adi[cç]|adquir)",
+    r"(?:aquisi|adi[cç]|aplica|compra|investiment).{0,40}(?:imobiliz|intang)"
+    r"|(?:imobiliz|intang).{0,30}(?:aquisi|adi[cç]|adquir)",
     re.IGNORECASE)
 
 
@@ -121,10 +124,13 @@ def fcf_brapi(ticker, token):
     if not it:
         return None
     reg = it[0]
-    return {"fcf": reg.get("freeCashFlow"),
-            "fco": reg.get("cashGeneratedInOperations"),
-            "inv": reg.get("investmentCashFlow"),
-            "endDate": reg.get("endDate")}
+    # o nome do campo de fluxo operacional varia; tenta os candidatos
+    fco = next((reg.get(k) for k in ("operatingCashFlow", "cashGeneratedInOperations",
+                                       "incomeFromOperations", "totalCashFromOperatingActivities")
+                if reg.get(k) not in (None, 0)), None)
+    return {"fcf": reg.get("freeCashFlow"), "fco": fco,
+            "inv": reg.get("investmentCashFlow"), "endDate": reg.get("endDate"),
+            "_campos": sorted(reg.keys())}
 
 
 def main():
@@ -197,7 +203,17 @@ def main():
     c = pd.DataFrame(res)
     c["capex_implicito"] = c["fco"] - c["b_fcf"]
 
-    print(f"{len(c)} empresas com FCF da brapi\n")
+    # BANCOS DISTORCEM: o fluxo operacional deles inclui movimentação de
+    # carteira de crédito (Banco do Brasil com R$ 127 bi de FCO), e eles não
+    # têm CapEx no sentido usual. Analisados à parte.
+    eh_banco = c["nome"].str.contains("BCO|BANCO|FINANC|SEGUR|CREDITO",
+                                        case=False, na=False)
+    print(f"{len(c)} empresas com FCF da brapi "
+          f"({int(eh_banco.sum())} bancos/financeiras, analisadas à parte)\n")
+    c_todas, c = c, c[~eh_banco].copy()
+    if c.empty:
+        print("Nenhuma não-financeira na amostra.")
+        return
     print("Testando definições candidatas (razão perto de 1 = acertou):\n")
 
     testes = {
@@ -207,19 +223,27 @@ def main():
         "FCO da brapi + inv. da brapi": c["b_fco"] + c["b_inv"],
     }
     for nome, calc in testes.items():
-        r = (calc / c["b_fcf"]).replace([float("inf"), float("-inf")], pd.NA).dropna()
+        r = calc / c["b_fcf"]
+        r = r[np.isfinite(r)].dropna()
         if r.empty:
             continue
         dentro = r.between(0.95, 1.05).mean() * 100
         print(f"  {nome:<34} mediana {r.median():>7.3f}  dentro de ±5%: {dentro:>5.1f}%")
 
     print("\nNosso FCO bate com o da brapi?")
-    rr = (c["fco"] / c["b_fco"]).replace([float("inf"), float("-inf")], pd.NA).dropna()
+    rr = c["fco"] / c["b_fco"]
+    rr = rr[np.isfinite(rr)].dropna() if rr.notna().any() else rr.dropna()
     if not rr.empty:
         print(f"  mediana {rr.median():.3f}, dentro de ±5%: {rr.between(0.95,1.05).mean()*100:.1f}%")
         print("  (se não bater, a brapi usa outro período ou a demonstração individual)")
 
-    print("\n10 maiores divergências:")
+    if "_campos" in c_todas.columns and len(c_todas):
+        campos = c_todas["_campos"].dropna()
+        if len(campos):
+            print(f"\nCampos disponíveis no cashflowHistory da brapi:")
+            print("  " + ", ".join(campos.iloc[0][:20]))
+
+    print("\n10 maiores divergências (só não-financeiras):")
     c["dif"] = (c["fco"] - c["b_fcf"]).abs()
     cols = ["tk", "fco", "b_fco", "b_fcf", "capex_dfc", "capex_implicito"]
     print(c.nlargest(10, "dif")[cols].to_string(index=False))
