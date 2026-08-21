@@ -70,6 +70,33 @@ RE_CAPEX = re.compile(
 CLASSES = ["PNE", "PND", "PNC", "PNB", "PNA", "PN", "ON"]   # do mais específico
 
 
+def datas_publicacao(ano, prefixo="dfp"):
+    """DT_RECEB por empresa, do arquivo-resumo.
+
+    A data de recebimento pela CVM - que é quando o dado ficou público - NÃO
+    está nos arquivos de DFC e DRE, só no resumo (`dfp_cia_aberta_AAAA.csv`).
+    Sem juntar por CD_CVM, os campos entram sem `published_date` e perdem o
+    point-in-time, que é justamente o motivo de calculá-los aqui em vez de
+    usar uma API pronta."""
+    obter = cvm_fonte.obter_dfp if prefixo == "dfp" else cvm_fonte.obter_itr
+    zf = obter(ano)
+    if zf is None:
+        return {}
+    alvo = f"{prefixo}_cia_aberta_{ano}.csv"
+    if alvo not in zf.namelist():
+        return {}
+    with zf.open(alvo) as f:
+        d = pd.read_csv(f, sep=";", encoding="latin-1", dtype={"CD_CVM": str})
+    if "DT_RECEB" not in d.columns or "CD_CVM" not in d.columns:
+        return {}
+    d["CD_CVM"] = d["CD_CVM"].astype(str).str.strip().str.lstrip("0")
+    if "VERSAO" in d.columns:
+        d["VERSAO"] = pd.to_numeric(d["VERSAO"], errors="coerce")
+        d = d.sort_values("VERSAO")
+    d = d.drop_duplicates("CD_CVM", keep="last")
+    return dict(zip(d["CD_CVM"], d["DT_RECEB"]))
+
+
 def ler(ano, nome, prefixo="dfp"):
     obter = cvm_fonte.obter_dfp if prefixo == "dfp" else cvm_fonte.obter_itr
     zf = obter(ano)
@@ -107,6 +134,7 @@ def extrair_fluxo(ano, prefixo="dfp"):
     d = ler(ano, "DFC_MI_con", prefixo)
     if d.empty:
         return []
+    pubs = datas_publicacao(ano, prefixo)
     linhas = []
     for cd, g in d.groupby("CD_CVM"):
         fco = g[g["CD_CONTA"] == "6.01"]["v"]
@@ -115,8 +143,7 @@ def extrair_fluxo(ano, prefixo="dfp"):
             continue
         fco = float(fco.iloc[0])
         dt = g["DT_FIM_EXERC"].iloc[0]
-        pub = g["DT_RECEB"].iloc[0] if "DT_RECEB" in g.columns else None
-        reg = {"cd_cvm": cd, "fiscal_date": dt, "published_date": pub,
+        reg = {"cd_cvm": cd, "fiscal_date": dt, "published_date": pubs.get(cd),
                 "Operating Cash Flow": fco}
         if not inv.empty:
             iv = float(inv.iloc[0])
@@ -141,13 +168,13 @@ def extrair_lpa(ano, prefixo="dfp"):
     alvo = d[d["CD_CONTA"].str.startswith(("3.99.01.", "3.99.02."))].copy()
     if alvo.empty:
         return []
+    pubs = datas_publicacao(ano, prefixo)
     alvo["classe"] = alvo["DS_CONTA"].apply(classe_da_descricao)
     alvo = alvo.dropna(subset=["classe", "v"])
     linhas = []
     for (cd, classe), g in alvo.groupby(["CD_CVM", "classe"]):
         dt = g["DT_FIM_EXERC"].iloc[0]
-        pub = g["DT_RECEB"].iloc[0] if "DT_RECEB" in g.columns else None
-        reg = {"cd_cvm": cd, "fiscal_date": dt, "published_date": pub}
+        reg = {"cd_cvm": cd, "fiscal_date": dt, "published_date": pubs.get(cd)}
         b = g[g["CD_CONTA"].str.startswith("3.99.01.")]["v"]
         dl = g[g["CD_CONTA"].str.startswith("3.99.02.")]["v"]
         if not b.empty:
@@ -255,7 +282,11 @@ def main():
     df = pd.DataFrame(todas, columns=["ticker", "stmt", "pt", "fiscal_date",
                                        "line_item", "v", "pub", "src"])
     print(f"\n{len(df):,} linhas, {df['ticker'].nunique()} tickers")
-    print(f"  com data de publicação: {df['pub'].notna().mean()*100:.1f}%")
+    cob = df["pub"].notna().mean() * 100
+    print(f"  com data de publicação: {cob:.1f}%")
+    if cob < 90:
+        print("  ⚠️ cobertura baixa - sem published_date estes campos não têm")
+        print("     point-in-time, que é a razão de calculá-los aqui.")
     print("\nPor campo:")
     print(df["line_item"].value_counts().head(12).to_string())
 
