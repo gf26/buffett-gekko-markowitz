@@ -62,10 +62,53 @@ warnings.filterwarnings("ignore", category=pd.errors.DtypeWarning)
 # Grupos SEM captura: com captura, o str.contains do pandas emite UserWarning.
 # Validado contra as descrições reais - separa "aquisição de imobilizado"
 # (CapEx) de "aquisição de subsidiárias" e "participação acionária" (não são).
-RE_CAPEX = re.compile(
-    r"(?:aquisi|adi[cç]|aplica|compra|investiment).{0,40}(?:imobiliz|intang)"
-    r"|(?:imobiliz|intang).{0,30}(?:aquisi|adi[cç]|adquir)",
+# CapEx: duas formas de identificar, mais uma lista de exclusão.
+#
+# FORMA 1 - verbo + objeto: "Aquisição de imobilizado", "Adições ao
+#   imobilizado e intangível", "Aplicação no imobilizado".
+#
+# FORMA 2 - só o objeto: 21 empresas descrevem simplesmente "Imobilizado",
+#   "Intangível", "No Imobilizado", "Em imobilizado". Aceitas apenas quando o
+#   VALOR É NEGATIVO - saída de caixa. Com valor positivo seria alienação, não
+#   investimento.
+#
+# EXCLUSÕES: participação societária e aplicação financeira também aparecem em
+#   6.02 e NÃO são CapEx. "Investimentos", "Aumento de Capital em
+#   Controladas", "Aplicações financeiras" precisam ficar de fora mesmo
+#   quando negativos.
+RE_CAPEX_VERBO = re.compile(
+    r"(?:aquisi|adi[cç]|aplica|compra|investiment|acr[ée]scim|aument)"
+    r".{0,40}(?:imobiliz|intang|ativo fixo|ativo n[ãa]o circulante"
+    r"|propriedade.{0,15}investiment|ativo biol[óo]gic)"
+    r"|(?:imobiliz|intang).{0,30}(?:aquisi|adi[cç]|adquir|acr[ée]scim)",
     re.IGNORECASE)
+
+RE_CAPEX_OBJETO = re.compile(
+    r"^\W*(?:n[oa]s?\s+|em\s+|d[oa]s?\s+|\(?\s*(?:acr[ée]scim|aument|redu[cç])\w*\)?"
+    r"[\s\)]*(?:e\s+)?(?:redu[cç]\w*\s*)?(?:d[oe]s?\s+|n[oa]s?\s+)?)*"
+    r"(?:ativo\s+)?(?:imobilizado|intang[íi]ve[li]s?|ativo\s+fixo|ativo\s+biol[óo]gico)"
+    r"\s*(?:e\s+(?:o\s+)?(?:ativo\s+)?(?:imobilizado|intang[íi]ve[li]s?))?\W*$",
+    re.IGNORECASE)
+
+# aparecem em 6.02 e NÃO são CapEx
+RE_NAO_CAPEX = re.compile(
+    r"aplica[cç].{0,20}financ|t[íi]tulo|valores mobili|dividend|juros"
+    r"|controlad|coligad|subsidi[áa]ri|participa[cç][ãa]o|SCP|SPE"
+    r"|m[úu]tuo|partes relacionad|caixa restrito|capital em|combina[cç][ãa]o de neg"
+    r"|aliena[cç]|resgate|venda",
+    re.IGNORECASE)
+
+
+def eh_capex(descricao, valor):
+    """CapEx é sempre saída de caixa. Valor positivo é alienação."""
+    ds = str(descricao)
+    if RE_NAO_CAPEX.search(ds):
+        return False
+    if RE_CAPEX_VERBO.search(ds):
+        return True
+    # só o substantivo: exige saída de caixa para não confundir com alienação
+    return bool(RE_CAPEX_OBJETO.match(ds)) and valor is not None and valor < 0
+
 
 CLASSES = ["PNE", "PND", "PNC", "PNB", "PNA", "PN", "ON"]   # do mais específico
 
@@ -154,7 +197,8 @@ def extrair_fluxo(ano, prefixo="dfp"):
 
         sub = g[g["CD_CONTA"].str.startswith("6.02.")]
         if not sub.empty:
-            cap = sub[sub["DS_CONTA"].astype(str).str.contains(RE_CAPEX, na=False)]["v"].sum()
+            mask = [eh_capex(ds, v) for ds, v in zip(sub["DS_CONTA"], sub["v"])]
+            cap = sub.loc[mask, "v"].sum()
             if cap:
                 reg["Capital Expenditure"] = abs(float(cap))
         linhas.append(reg)
