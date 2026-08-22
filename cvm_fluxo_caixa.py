@@ -191,8 +191,14 @@ def extrair_fluxo(ano, prefixo="dfp"):
         if not inv.empty:
             iv = float(inv.iloc[0])
             reg["Investing Cash Flow"] = iv
-            # FCF = FCO + investimento. O 6.02 é negativo (saída de caixa),
-            # então somar equivale a subtrair o investimento.
+            # FCF AMPLO = FCO + investimento total. O 6.02 é negativo (saída de
+            # caixa), então somar equivale a subtrair o investimento.
+            #
+            # É a definição que a brapi usa - verificado: nosso investimento
+            # total bate com o que ela subtrai do FCO em 100% dos casos, dentro
+            # de ±5%. Mas o 6.02 inclui aplicações financeiras e compra de
+            # participações, o que distorce bancos: o Banco do Brasil aparece
+            # com R$ 168 bi de "investimento" que é movimentação de carteira.
             reg["Free Cash Flow"] = fco + iv
 
         sub = g[g["CD_CONTA"].str.startswith("6.02.")]
@@ -200,7 +206,14 @@ def extrair_fluxo(ano, prefixo="dfp"):
             mask = [eh_capex(ds, v) for ds, v in zip(sub["DS_CONTA"], sub["v"])]
             cap = sub.loc[mask, "v"].sum()
             if cap:
-                reg["Capital Expenditure"] = abs(float(cap))
+                capex = abs(float(cap))
+                reg["Capital Expenditure"] = capex
+                # FCF ESTRITO = FCO - CapEx, só investimento produtivo.
+                # Convive com o amplo de propósito: são conceitos diferentes e
+                # merecem nomes diferentes. Para o fator fcf_me do JKP, o
+                # estrito é o adequado; o amplo serve para comparar com fontes
+                # de mercado, que usam a definição larga.
+                reg["Free Cash Flow (CapEx)"] = fco - capex
         linhas.append(reg)
     return linhas
 
@@ -272,7 +285,8 @@ def gravar(engine, linhas):
             cur.execute("""
                 DELETE FROM financials WHERE source='cvm'
                   AND line_item IN ('Operating Cash Flow','Investing Cash Flow',
-                                     'Free Cash Flow','Capital Expenditure')
+                                     'Free Cash Flow','Free Cash Flow (CapEx)',
+                                     'Capital Expenditure')
             """)
             cur.execute("DELETE FROM financials WHERE source='cvm' AND line_item LIKE '%%EPS %%'")
             LOTE = 50_000
