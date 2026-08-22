@@ -99,9 +99,66 @@ RE_NAO_CAPEX = re.compile(
     re.IGNORECASE)
 
 
+# Descrições confirmadas MANUALMENTE, após revisão do que escapava das
+# regras automáticas. A CVM permite 2.303 descrições distintas em 6.02, e a
+# partir de certo ponto olhar o que sobrou é mais barato e mais seguro que
+# ampliar o regex - cada ampliação captura menos e arrisca mais.
+#
+# "Ativo Permanente" é a nomenclatura pré-2008 do ativo não circulante, e
+# engloba imobilizado e intangível.
+DESCRICOES_CAPEX_MANUAIS = {
+    "Adição ao Ativo Permanente",
+    "Adições ao Ativo Permanente",
+    "Aquisições Líquidas de Bens do Ativo Permanente",
+    "Aquisições do Ativo Permanente",
+    "Ativos Imobilizados",
+    "Ativos Intangiveis",
+    "Ativos Intangíveis",
+}
+
+# Confirmadas como NÃO-CapEx. Falso positivo é pior que cobertura incompleta:
+# contamina o indicador sem avisar. "Investimentos" e "Aumento de Capital"
+# parecem CapEx e são participação societária.
+DESCRICOES_NAO_CAPEX_MANUAIS = {
+    "(Aquisição) e baixas em investimentos",
+    "Adiantamento a Funcionarios e Fornecedores",
+    "Adiantamento para Futuro Aumento de Capital",
+    "Adiantamento para futuro aumento de capital",
+    "Ajustes Acumulados de Conversão de Moedas",
+    "Aplicações em Investimentos",
+    "Aportes/aumento de capital",
+    "Aquisição de Bens e Investimentos",
+    "Aquisição de Investimentos",
+    "Aquisição de ativo",
+    "Aquisição de bens e investimentos",
+    "Ativos tangíveis",
+    "Aumento de Capital",
+    "Aumento de Investimento",
+    "Auste de Conversão de Moedas",
+    "Depósitos Judiciais",
+    "Incorporação",
+    "Integralização de Capital Social",
+    "Investimento em Participações",
+    "Investimentos",
+    "Investimentos em participações",
+    "Ivestimentos",
+    "Outras aplicações em atividades de investimento",
+    "Outros",
+    "Outros Investimentos",
+    "Recebimento de Empréstimos de Empresas Ligadas",
+    "Transferencia de caixa cisão",
+}
+
+
 def eh_capex(descricao, valor):
     """CapEx é sempre saída de caixa. Valor positivo é alienação."""
     ds = str(descricao)
+    limpo = ds.strip()
+    # listas manuais têm prioridade sobre as regras automáticas
+    if limpo in DESCRICOES_NAO_CAPEX_MANUAIS:
+        return False
+    if limpo in DESCRICOES_CAPEX_MANUAIS:
+        return True
     if RE_NAO_CAPEX.search(ds):
         return False
     if RE_CAPEX_VERBO.search(ds):
